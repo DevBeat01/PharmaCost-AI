@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="制药企业成本智能分析与归因报告平台 - GMP合规级数据看板">
+  <title>成本智能分析系统 | ERP</title>
+  <link rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='3' fill='%23d4610a'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3.5' stroke-linecap='square'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/css/style.css?v=20260901-1">
+  <script src="/static/vendor/echarts.min.js"></script>
+  <script src="/static/vendor/lucide.min.js"></script>
+</head>
+
+<body class="min-h-screen font-sans antialiased">
+  <div class="app-shell">
+    <!-- LEFT SIDEBAR -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <img src="/static/images/logo1.png" alt="Logo"
+          style="width:50px;height:50px;object-fit:contain;flex-shrink:0;border-radius:6px">
+        <div class="brand-text">
+          <div class="brand-title">医药成本分析系统</div>
+        </div>
+      </div>
+      <nav class="sidebar-nav" aria-label="主导航">
+        <a href="#dashboard" class="nav-item active" data-page="dashboard">
+          <i data-lucide="layout-dashboard" class="nav-icon"></i>
+          <span>成本看板</span>
+        </a>
+        <a href="#report" class="nav-item" data-page="report">
+          <i data-lucide="file-text" class="nav-icon"></i>
+          <span>智能报告</span>
+        </a>
+        <a href="#benchmark" class="nav-item" data-page="benchmark">
+          <i data-lucide="bar-chart-2" class="nav-icon"></i>
+          <span>对标分析</span>
+        </a>
+        <a href="#rpa" class="nav-item" data-page="rpa">
+          <i data-lucide="check-circle-2" class="nav-icon"></i>
+          <span>RPA整改</span>
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="system-status">
+          <span class="status-dot"></span>
+          <span class="status-label">系统运行正常</span>
+        </div>
+        <div class="version">PharmaCost-AI v2.6</div>
+      </div>
+    </aside>
+
+    <!-- MAIN CONTENT AREA -->
+    <div class="main-wrap">
+      <header class="top-header">
+        <div class="header-left">
+          <div class="page-title-slot">
+            <h1 id="pageTitle">成本看板</h1>
+            <p id="pageSubtitle">实时掌握制药成本全貌</p>
+          </div>
+        </div>
+        <div class="header-right">
+          <div class="search-box">
+            <i data-lucide="search" style="width:16px;height:16px;flex-shrink:0"></i>
+            <input type="text" placeholder="搜索功能、数据、报告..." aria-label="搜索">
+          </div>
+          <button class="header-icon-btn" aria-label="通知">
+            <i data-lucide="bell" style="width:18px;height:18px"></i>
+            <span class="notification-dot"></span>
+          </button>
+          <button class="header-icon-btn" aria-label="帮助">
+            <i data-lucide="help-circle" style="width:18px;height:18px"></i>
+          </button>
+          <button class="header-icon-btn" id="settingsButton" aria-label="系统设置" title="系统设置">
+            <i data-lucide="settings" style="width:18px;height:18px"></i>
+          </button>
+          <div class="user-profile">
+            <div class="user-avatar">财</div>
+            <div class="user-info">
+              <div class="user-name">成本会计</div>
+              <div class="user-role">财务部</div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="page-main">
+        <div class="page-content">
+          <!-- Global selectors (hidden, for JS functionality) -->
+          <div class="global-selectors" id="globalSelectors" style="display:none">
+            <div class="selector-group">
+              <label for="globalProduct">产品：</label>
+              <select id="globalProduct" class="selector"></select>
+            </div>
+            <div class="selector-group">
+              <label for="globalMonth">会计月：</label>
+              <select id="globalMonth" class="selector"></select>
+            </div>
+          </div>
+
+          <!-- Page containers -->
+          <div id="page-dashboard" class="page-container active"></div>
+          <div id="page-report" class="page-container"></div>
+          <div id="page-benchmark" class="page-container"></div>
+          <div id="page-rpa" class="page-container"></div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div class="settings-backdrop" id="settingsDialog" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+    <section class="settings-dialog">
+      <header class="settings-dialog-header">
+        <div>
+          <h2 id="settingsTitle">系统设置</h2>
+          <p>管理分析数据、知识文档与报告模板</p>
+        </div>
+        <button class="header-icon-btn" id="settingsClose" type="button" aria-label="关闭设置" title="关闭">
+          <i data-lucide="x" style="width:18px;height:18px"></i>
+        </button>
+      </header>
+      <div class="settings-dialog-body">
+        <div class="settings-status" id="settingsSystemStatus"></div>
+        <section class="settings-section" aria-labelledby="settingsDataTitle">
+          <div class="settings-section-title">
+            <div><h3 id="settingsDataTitle">成本数据文件</h3><p>导入 CSV 后立即校验并重载；删除导入文件将恢复竞赛默认数据。</p></div>
+            <button class="settings-action-button" id="settingsReloadData" type="button"><i data-lucide="refresh-cw"></i>重载数据</button>
+          </div>
+          <div class="settings-file-list" id="settingsDataFiles"></div>
+        </section>
+        <section class="settings-section" aria-labelledby="settingsKnowledgeTitle">
+          <div class="settings-section-title">
+            <div><h3 id="settingsKnowledgeTitle">RAG 知识文档</h3><p>支持 PDF、Word、TXT。导入或删除后，系统会在后台增量更新知识库。</p></div>
+            <label class="settings-action-button settings-upload-button"><i data-lucide="upload"></i>导入文档<input id="settingsKnowledgeUpload" type="file" accept=".pdf,.docx,.txt" hidden></label>
+          </div>
+          <div class="settings-file-list" id="settingsKnowledgeFiles"></div>
+          <button class="settings-text-button" id="settingsRebuildKnowledge" type="button"><i data-lucide="database-zap"></i>重新构建知识库</button>
+        </section>
+        <section class="settings-section" aria-labelledby="settingsTemplateTitle">
+          <div class="settings-section-title">
+            <div><h3 id="settingsTemplateTitle">报告模板</h3><p>仅支持 Word（.docx）。新模板将在下一次报告生成时生效。</p></div>
+            <label class="settings-action-button settings-upload-button"><i data-lucide="upload"></i>导入模板<input id="settingsTemplateUpload" type="file" accept=".docx" hidden></label>
+          </div>
+          <div class="settings-file-list" id="settingsTemplateFile"></div>
+        </section>
+      </div>
+      <footer class="settings-dialog-footer" id="settingsMessage" aria-live="polite"></footer>
+    </section>
+  </div>
+
+  <!-- Loading overlay -->
+  <div class="loading-overlay" id="loadingOverlay" style="display:none">
+    <div class="loading-spinner"></div>
+    <p class="loading-text">数据加载中...</p>
+  </div>
+
+  <!-- Scripts -->
+  <script src="/static/js/app.js"></script>
+  <script src="/static/js/settings.js?v=20260901-1"></script>
+  <script src="/static/js/dashboard.js?v=20260831-2"></script>
+  <script src="/static/js/report.js?v=20260829-1"></script>
+  <script src="/static/js/benchmark.js?v=20260831-3"></script>
+  <script src="/static/js/rpa.js?v=20260831-5"></script>
+  <script>lucide.createIcons();</script>
+</body>
+
+</html>

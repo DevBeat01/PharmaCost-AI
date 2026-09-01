@@ -1,0 +1,17 @@
+.git
+.pytest_cache
+__pycache__
+*.pyc
+tests
+tmp
+创灵境_考题模拟数据
+chroma_db
+app/chroma_db
+app/output
+app/settings
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+app/output/*.docx
+app/output/*.pdf
+app/output/verify_current

@@ -1,0 +1,40 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - app/.env
+    environment:
+      DATA_DIR: /data
+    depends_on:
+      - rpa
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - ./app/chroma_db:/app/app/chroma_db
+      - ./app/output:/app/app/output
+      - ./app/rpa_tasks.sqlite3:/app/app/rpa_tasks.sqlite3
+      - ./app/report_tasks.sqlite3:/app/app/report_tasks.sqlite3
+      - ./app/settings:/app/app/settings
+      # 竞赛数据包不随源码仓库提交；请在项目根目录提供该目录。
+      - ./创灵境_考题模拟数据:/data:ro
+
+  rpa:
+    build:
+      context: ./rpa_mock
+      dockerfile: Dockerfile
+    ports:
+      - "8090:8090"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
