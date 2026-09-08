@@ -358,20 +358,18 @@ const TaskDraftDialog = {
             <section class="task-draft-dialog" role="dialog" aria-modal="true" aria-labelledby="taskDraftDialogTitle">
                 <header class="task-draft-dialog-header">
                     <div><h3 id="taskDraftDialogTitle">整改任务审阅</h3><p>修改并勾选需要保存的任务草稿，发送 RPA 和微信请在模块四处理</p></div>
-                    <button type="button" class="header-icon-btn" data-dialog-close aria-label="关闭" title="关闭"><i data-lucide="x"></i></button>
+                    <button type="button" class="header-icon-btn" id="taskDraftDialogClose" aria-label="关闭" title="关闭"><i data-lucide="x"></i></button>
                 </header>
                 <div class="task-draft-dialog-body">
                     <div class="task-draft-dialog-toolbar"><label><input type="checkbox" id="selectAllDraftTasks"> 全选</label><span id="taskDraftDialogMessage">请选择要发送的任务</span></div>
                     <div class="data-table-wrapper"><table class="data-table task-draft-dialog-table"><thead><tr><th>选择</th><th>任务标题</th><th>责任人</th><th>优先级</th><th>截止日</th></tr></thead><tbody>${rows}</tbody></table></div>
                 </div>
                 <footer class="task-draft-dialog-footer">
-                    <button type="button" class="btn btn-outline" data-dialog-close>稍后处理</button>
                     <button type="button" class="btn btn-primary" id="btnDialogSave"><i data-lucide="save" style="width:16px;height:16px"></i> 生成选中草稿</button>
                 </footer>
             </section>`;
         document.body.appendChild(dialog);
-        dialog.querySelectorAll('[data-dialog-close]').forEach(button => button.addEventListener('click', () => this.close()));
-        dialog.addEventListener('click', event => { if (event.target === dialog) this.close(); });
+        dialog.querySelector('#taskDraftDialogClose').addEventListener('click', () => this.close());
         dialog.querySelector('#selectAllDraftTasks').addEventListener('change', event => {
             dialog.querySelectorAll('.draft-dialog-selector').forEach(input => { input.checked = event.target.checked; });
             dialog.querySelector('#taskDraftDialogMessage').textContent = event.target.checked
