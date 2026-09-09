@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+import shutil
 import threading
 from datetime import datetime
 from io import BytesIO
@@ -20,6 +21,8 @@ from config import (
     MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, MIMO_VERIFY_SSL, MIMO_PROVIDER_LABEL,
 )
 from data.cost_data import cost_service
+from resources.manager import resource_manager
+from report.template_parser import TemplateParser
 
 router = APIRouter()
 logger = logging.getLogger("settings")
@@ -67,6 +70,23 @@ async def _read_upload(file: UploadFile, suffixes: set[str]) -> tuple[bytes, str
     return content, filename
 
 
+def _validate_knowledge_content(content: bytes, filename: str) -> dict:
+    """Validate container integrity before a document enters the active RAG set."""
+    suffix = Path(filename).suffix.lower()
+    try:
+        if suffix == ".docx":
+            Document(BytesIO(content))
+        elif suffix == ".pdf":
+            import pymupdf as fitz
+            document = fitz.open(stream=content, filetype="pdf")
+            document.close()
+        else:
+            content.decode("utf-8-sig")
+    except Exception as exc:
+        raise HTTPException(422, f"知识文档无法解析: {exc}") from exc
+    return {"valid": True, "format": suffix.lstrip("."), "bytes": len(content)}
+
+
 def _read_overrides() -> dict:
     try:
         data = json.loads(DATA_SOURCE_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -105,13 +125,117 @@ def _model_summary() -> dict:
     }
 
 
-def _file_info(path: Path, *, deletable: bool, key: str | None = None, label: str | None = None) -> dict:
-    stat = path.stat()
-    return {
+def _file_info(path: Path, *, deletable: bool, key: str | None = None,
+               label: str | None = None, resource: dict | None = None) -> dict:
+    if path.is_file():
+        stat = path.stat()
+        size = stat.st_size
+        updated_at = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+    else:
+        size = 0
+        updated_at = ""
+    info = {
         "key": key, "label": label or path.name, "name": path.name,
-        "size": stat.st_size, "updated_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+        "size": size, "updated_at": updated_at,
         "imported": deletable, "deletable": deletable,
     }
+    if resource:
+        info.update({
+            "resource_id": resource["resource_id"],
+            "version": resource["version"],
+            "status": resource["status"],
+            "sha256": resource["sha256"],
+            "created_at": resource["created_at"],
+            "published_at": resource.get("published_at"),
+            "validation": resource.get("metadata", {}).get("validation", {}),
+        })
+    return info
+
+
+def _resource_filename(resource: dict) -> str:
+    return str(resource.get("metadata", {}).get("original_filename") or resource["filename"])
+
+
+def _sync_template_compat(resource: dict | None) -> None:
+    """Keep the old mirror path available for older integrations."""
+    TEMPLATE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    if resource:
+        source = Path(resource["path"])
+        temp = CUSTOM_TEMPLATE_PATH.with_suffix(".tmp")
+        shutil.copyfile(source, temp)
+        temp.replace(CUSTOM_TEMPLATE_PATH)
+    else:
+        CUSTOM_TEMPLATE_PATH.unlink(missing_ok=True)
+
+
+def _sync_knowledge_compat() -> None:
+    """Mirror active managed documents into the directory scanned by the RAG builder."""
+    KNOWLEDGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    records = resource_manager.list("knowledge")
+    managed_names = {_resource_filename(record) for record in records}
+    for path in KNOWLEDGE_UPLOAD_DIR.iterdir():
+        if path.is_file() and path.name in managed_names:
+            path.unlink(missing_ok=True)
+    for record in records:
+        if record["status"] != "active":
+            continue
+        target = KNOWLEDGE_UPLOAD_DIR / _resource_filename(record)
+        temp = target.with_suffix(target.suffix + ".tmp")
+        shutil.copyfile(record["path"], temp)
+        temp.replace(target)
+
+
+def _apply_data_resource(resource: dict | None) -> None:
+    """Apply a managed data version and refresh the legacy override mirror."""
+    if resource is None:
+        return
+    DATA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target = DATA_UPLOAD_DIR / f"{resource['logical_key']}.csv"
+    temp = target.with_suffix(".tmp")
+    shutil.copyfile(resource["path"], temp)
+    temp.replace(target)
+    overrides = _read_overrides()
+    overrides[resource["logical_key"]] = str(target)
+    _write_overrides(overrides)
+    cost_service.load_all()
+
+
+def _clear_data_resource(key: str) -> None:
+    overrides = _read_overrides()
+    overrides.pop(key, None)
+    _write_overrides(overrides)
+    (DATA_UPLOAD_DIR / f"{key}.csv").unlink(missing_ok=True)
+    cost_service.load_all()
+
+
+def _publish_resource(resource_id: str) -> dict:
+    resource = resource_manager.get(resource_id)
+    if not resource:
+        raise HTTPException(404, "资源版本不存在")
+    if resource["resource_type"] not in {"data", "knowledge", "template"}:
+        raise HTTPException(422, "不支持发布该资源类型")
+    previous = resource_manager.active_record(resource["resource_type"], resource["logical_key"])
+    published = resource_manager.publish(resource_id)
+    try:
+        if published["resource_type"] == "data":
+            _apply_data_resource(published)
+        elif published["resource_type"] == "template":
+            _sync_template_compat(published)
+        else:
+            _sync_knowledge_compat()
+            _schedule_knowledge_build()
+    except Exception as exc:
+        resource_manager.archive(published["resource_id"])
+        if previous:
+            restored = resource_manager.publish(previous["resource_id"])
+            if restored["resource_type"] == "data":
+                _apply_data_resource(restored)
+            elif restored["resource_type"] == "template":
+                _sync_template_compat(restored)
+            else:
+                _sync_knowledge_compat()
+        raise HTTPException(422, f"资源发布失败，已恢复上一版本: {exc}") from exc
+    return published
 
 
 def _schedule_knowledge_build() -> None:
@@ -129,19 +253,24 @@ def _summary() -> dict:
     data_files = []
     for key, default in DATA_FILE_DEFAULTS.items():
         current = get_data_file(key)
-        imported = key in overrides and current != default
-        data_files.append(_file_info(current, deletable=imported, key=key, label=DATA_FILE_LABELS[key]))
+        resource = resource_manager.active_record("data", key)
+        imported = bool(resource) or (key in overrides and current != default)
+        data_files.append(_file_info(current, deletable=imported, key=key,
+                                     label=DATA_FILE_LABELS[key], resource=resource))
 
     knowledge_files = []
-    for path in sorted(KNOWLEDGE_DIR.iterdir()):
-        if path.is_file() and path.suffix.lower() in {".pdf", ".docx", ".txt"}:
-            knowledge_files.append(_file_info(path, deletable=False))
+    if KNOWLEDGE_DIR.exists():
+        for path in sorted(KNOWLEDGE_DIR.iterdir()):
+            if path.is_file() and path.suffix.lower() in {".pdf", ".docx", ".txt"}:
+                knowledge_files.append(_file_info(path, deletable=False))
     if KNOWLEDGE_UPLOAD_DIR.exists():
         for path in sorted(KNOWLEDGE_UPLOAD_DIR.iterdir()):
             if path.is_file() and path.suffix.lower() in {".pdf", ".docx", ".txt"}:
-                knowledge_files.append(_file_info(path, deletable=True))
+                resource = resource_manager.active_record("knowledge", path.name)
+                knowledge_files.append(_file_info(path, deletable=True, resource=resource))
 
     template = get_report_template_path()
+    template_resource = resource_manager.active_record("template", "default")
     try:
         from rag.vector_store import VectorStore
         rag = VectorStore.status()
@@ -150,7 +279,9 @@ def _summary() -> dict:
     return {
         "data_files": data_files,
         "knowledge_files": knowledge_files,
-        "template": _file_info(template, deletable=template == CUSTOM_TEMPLATE_PATH, label="当前报告模板"),
+        "template": _file_info(template, deletable=bool(template_resource) or template == CUSTOM_TEMPLATE_PATH,
+                                label="当前报告模板", resource=template_resource),
+        "resources": resource_manager.summary(),
         "system": {
             "data_loaded": cost_service._loaded,
             "rag": rag,
@@ -210,7 +341,7 @@ async def reset_models():
 async def upload_data_file(key: str, file: UploadFile = File(...)):
     if key not in DATA_FILE_DEFAULTS:
         raise HTTPException(404, "未知数据文件类型")
-    content, _ = await _read_upload(file, {".csv"})
+    content, filename = await _read_upload(file, {".csv"})
     try:
         uploaded_columns = set(pd.read_csv(BytesIO(content), encoding="utf-8-sig", nrows=0).columns.str.strip())
         expected_columns = set(pd.read_csv(DATA_FILE_DEFAULTS[key], encoding="utf-8-sig", nrows=0).columns.str.strip())
@@ -220,50 +351,66 @@ async def upload_data_file(key: str, file: UploadFile = File(...)):
     if missing:
         raise HTTPException(422, f"CSV 缺少必要字段: {', '.join(sorted(missing))}")
 
-    DATA_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    target = DATA_UPLOAD_DIR / f"{key}.csv"
-    target.write_bytes(content)
-    overrides = _read_overrides()
-    overrides[key] = str(target)
-    _write_overrides(overrides)
+    record = resource_manager.save_bytes(
+        "data", key, filename, content,
+        metadata={"original_filename": filename, "validation": {
+            "valid": True, "columns": len(uploaded_columns), "missing_columns": []
+        }},
+    )
     try:
-        cost_service.load_all()
-    except Exception as exc:
-        target.unlink(missing_ok=True)
-        overrides.pop(key, None)
-        _write_overrides(overrides)
-        cost_service.load_all()
-        raise HTTPException(422, f"数据重载失败，已恢复原文件: {exc}") from exc
-    return {"message": f"{DATA_FILE_LABELS[key]}已导入并生效", "summary": _summary()}
+        published = _publish_resource(record["resource_id"])
+    except Exception:
+        # _publish_resource restores the previous active version on failure.
+        raise
+    return {"message": f"{DATA_FILE_LABELS[key]}已导入并生效（版本 v{published['version']}）", "summary": _summary()}
 
 
 @router.delete("/data/{key}")
 async def delete_data_file(key: str):
     if key not in DATA_FILE_DEFAULTS:
         raise HTTPException(404, "未知数据文件类型")
-    overrides = _read_overrides()
-    path = Path(overrides.pop(key, ""))
-    if not path.is_file():
-        raise HTTPException(409, "当前使用默认数据，无法删除")
-    path.unlink()
-    _write_overrides(overrides)
-    cost_service.load_all()
+    active = resource_manager.active_record("data", key)
+    if active:
+        resource_manager.archive(active["resource_id"])
+        try:
+            _clear_data_resource(key)
+        except Exception as exc:
+            resource_manager.publish(active["resource_id"])
+            _apply_data_resource(active)
+            raise HTTPException(422, f"恢复默认数据失败: {exc}") from exc
+    else:
+        overrides = _read_overrides()
+        path = Path(overrides.pop(key, ""))
+        if not path.is_file():
+            raise HTTPException(409, "当前使用默认数据，无法删除")
+        path.unlink(missing_ok=True)
+        _write_overrides(overrides)
+        cost_service.load_all()
     return {"message": f"已恢复默认{DATA_FILE_LABELS[key]}", "summary": _summary()}
 
 
 @router.post("/knowledge")
 async def upload_knowledge_file(file: UploadFile = File(...)):
     content, filename = await _read_upload(file, {".pdf", ".docx", ".txt"})
-    KNOWLEDGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    target = KNOWLEDGE_UPLOAD_DIR / filename
-    target.write_bytes(content)
-    _schedule_knowledge_build()
-    return {"message": "知识文档已导入，知识库正在后台更新", "summary": _summary()}
+    validation = _validate_knowledge_content(content, filename)
+    record = resource_manager.save_bytes(
+        "knowledge", filename, filename, content,
+        metadata={"original_filename": filename, "validation": validation},
+    )
+    published = _publish_resource(record["resource_id"])
+    return {"message": f"知识文档已导入（版本 v{published['version']}），知识库正在后台更新", "summary": _summary()}
 
 
 @router.delete("/knowledge/{filename}")
 async def delete_knowledge_file(filename: str):
-    target = (KNOWLEDGE_UPLOAD_DIR / _safe_filename(filename)).resolve()
+    safe_name = _safe_filename(filename)
+    active = resource_manager.active_record("knowledge", safe_name)
+    if active:
+        resource_manager.archive(active["resource_id"])
+        _sync_knowledge_compat()
+        _schedule_knowledge_build()
+        return {"message": "知识文档已删除，知识库正在后台更新", "summary": _summary()}
+    target = (KNOWLEDGE_UPLOAD_DIR / safe_name).resolve()
     try:
         target.relative_to(KNOWLEDGE_UPLOAD_DIR.resolve())
     except ValueError as exc:
@@ -277,18 +424,32 @@ async def delete_knowledge_file(filename: str):
 
 @router.post("/template")
 async def upload_template(file: UploadFile = File(...)):
-    content, _ = await _read_upload(file, {".docx"})
+    content, filename = await _read_upload(file, {".docx"})
     try:
-        Document(BytesIO(content))
+        document = Document(BytesIO(content))
+        placeholder_count = len(TemplateParser.PLACEHOLDER_RE.findall("\n".join(
+            [p.text for p in document.paragraphs] +
+            [cell.text for table in document.tables for row in table.rows for cell in row.cells]
+        )))
     except Exception as exc:
         raise HTTPException(422, f"报告模板不是有效的 Word 文件: {exc}") from exc
-    TEMPLATE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    CUSTOM_TEMPLATE_PATH.write_bytes(content)
-    return {"message": "报告模板已导入，后续生成报告将使用新模板", "summary": _summary()}
+    record = resource_manager.save_bytes(
+        "template", "default", filename, content,
+        metadata={"original_filename": filename, "validation": {
+            "valid": True, "placeholder_count": placeholder_count
+        }},
+    )
+    published = _publish_resource(record["resource_id"])
+    return {"message": f"报告模板已导入并生效（版本 v{published['version']}）", "summary": _summary()}
 
 
 @router.delete("/template")
 async def delete_template():
+    active = resource_manager.active_record("template", "default")
+    if active:
+        resource_manager.archive(active["resource_id"])
+        _sync_template_compat(None)
+        return {"message": "已恢复默认报告模板", "summary": _summary()}
     if not CUSTOM_TEMPLATE_PATH.is_file():
         raise HTTPException(409, "当前使用默认报告模板，无法删除")
     CUSTOM_TEMPLATE_PATH.unlink()
@@ -305,3 +466,39 @@ async def reload_data():
 async def rebuild_knowledge():
     _schedule_knowledge_build()
     return {"message": "知识库重建任务已启动", "summary": _summary()}
+
+
+@router.get("/resources")
+async def list_resources(resource_type: str | None = None, logical_key: str | None = None):
+    return {"resources": resource_manager.list(resource_type, logical_key)}
+
+
+@router.get("/resources/{resource_id}")
+async def get_resource(resource_id: str):
+    resource = resource_manager.get(resource_id)
+    if not resource:
+        raise HTTPException(404, "资源版本不存在")
+    return resource
+
+
+@router.post("/resources/{resource_id}/publish")
+async def publish_resource(resource_id: str):
+    resource = _publish_resource(resource_id)
+    return {"message": f"资源已发布（版本 v{resource['version']}）", "resource": resource, "summary": _summary()}
+
+
+@router.post("/resources/{resource_id}/rollback")
+async def rollback_resource(resource_id: str):
+    resource = _publish_resource(resource_id)
+    return {"message": f"已回滚至版本 v{resource['version']}", "resource": resource, "summary": _summary()}
+
+
+@router.delete("/resources/{resource_id}")
+async def delete_resource(resource_id: str):
+    resource = resource_manager.get(resource_id)
+    if not resource:
+        raise HTTPException(404, "资源版本不存在")
+    if resource["status"] == "active":
+        raise HTTPException(409, "当前版本正在使用，请通过对应设置接口恢复默认后再删除")
+    resource_manager.discard(resource_id)
+    return {"message": "资源历史版本已删除", "summary": _summary()}

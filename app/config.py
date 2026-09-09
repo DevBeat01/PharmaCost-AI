@@ -57,6 +57,15 @@ CUSTOM_TEMPLATE_PATH = TEMPLATE_UPLOAD_DIR / "active_template.docx"
 def get_data_file(key: str) -> Path:
     """Return an imported override when one is configured, otherwise the contest source CSV."""
     default = DATA_FILE_DEFAULTS[key]
+    # Prefer a published version from the resource registry. The legacy JSON
+    # override remains as a backwards-compatible fallback for old deployments.
+    try:
+        from resources.manager import resource_manager
+        published = resource_manager.active_path("data", key)
+        if published is not None:
+            return published
+    except Exception:
+        pass
     try:
         import json
         overrides = json.loads(DATA_SOURCE_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -70,6 +79,13 @@ def get_data_file(key: str) -> Path:
 
 def get_report_template_path() -> Path:
     """Use the managed template override only when it is a valid local file."""
+    try:
+        from resources.manager import resource_manager
+        published = resource_manager.active_path("template", "default")
+        if published is not None:
+            return published
+    except Exception:
+        pass
     return CUSTOM_TEMPLATE_PATH if CUSTOM_TEMPLATE_PATH.is_file() else TEMPLATE_DOCX
 
 # LLM配置：环境变量提供默认值，系统设置中的运行时覆盖文件优先级更高。

@@ -141,10 +141,11 @@
 
         fileRow(file, actions = '') {
             const state = file.imported ? '<span class="settings-file-badge imported">已导入</span>' : '<span class="settings-file-badge">默认</span>';
+            const version = file.version ? ` · 版本 v${file.version}` : '';
             return `<div class="settings-file-row">
               <span class="settings-file-icon"><i data-lucide="file-text"></i></span>
               <div class="settings-file-meta"><div class="settings-file-name" title="${Utils.escapeHtml(file.name)}">${Utils.escapeHtml(file.label || file.name)}</div>
-                <div class="settings-file-detail">${Utils.escapeHtml(file.name)} · ${this.size(file.size)} · ${Utils.escapeHtml(file.updated_at || '')}</div></div>
+                <div class="settings-file-detail">${Utils.escapeHtml(file.name)} · ${this.size(file.size)} · ${Utils.escapeHtml(file.updated_at || '')}${version}</div></div>
               ${state}${actions}
             </div>`;
         },
