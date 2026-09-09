@@ -5,6 +5,7 @@
     const Settings = {
         dialog: null,
         summary: null,
+        resources: [],
 
         init() {
             this.dialog = document.getElementById('settingsDialog');
@@ -20,6 +21,7 @@
             document.getElementById('settingsRebuildKnowledge')?.addEventListener('click', () => this.action('/api/settings/rebuild-knowledge', '知识库重建任务已启动'));
             document.getElementById('settingsSaveModels')?.addEventListener('click', () => this.saveModels());
             document.getElementById('settingsResetModels')?.addEventListener('click', () => this.resetModels());
+            document.getElementById('settingsRefreshResources')?.addEventListener('click', () => this.refreshResources());
             this.bindModelPresets();
             document.getElementById('settingsKnowledgeUpload')?.addEventListener('change', event => this.upload('/api/settings/knowledge', event.target));
             document.getElementById('settingsTemplateUpload')?.addEventListener('change', event => this.upload('/api/settings/template', event.target));
@@ -45,7 +47,11 @@
 
         async refresh() {
             try {
-                const data = await Utils.api('/api/settings/summary', { timeoutMs: 20000 });
+                const [data, resourceData] = await Promise.all([
+                    Utils.api('/api/settings/summary', { timeoutMs: 20000 }),
+                    Utils.api('/api/settings/resources', { timeoutMs: 20000 }),
+                ]);
+                this.resources = resourceData.resources || [];
                 this.render(data);
                 this.message('');
             } catch (error) {
@@ -69,7 +75,24 @@
             this.renderModels(data.models || {});
             this.renderKnowledgeFiles(data.knowledge_files || []);
             this.renderTemplate(data.template || null);
+            this.renderResources(this.resources);
             refreshIcons();
+        },
+
+        async refreshResources() {
+            const button = document.getElementById('settingsRefreshResources');
+            if (button) button.disabled = true;
+            try {
+                const data = await Utils.api('/api/settings/resources', { timeoutMs: 20000 });
+                this.resources = data.resources || [];
+                this.renderResources(this.resources);
+                refreshIcons();
+                this.message('资源版本已刷新', 'success');
+            } catch (error) {
+                this.message(`无法读取资源版本：${error.message || '请求失败'}`, 'error');
+            } finally {
+                if (button) button.disabled = false;
+            }
         },
 
         modelPresets: {
@@ -139,6 +162,47 @@
                 ? this.deleteButton('template', '', '删除自定义报告模板并恢复默认模板？') : '') : this.empty('未找到报告模板');
         },
 
+        renderResources(resources) {
+            const target = document.getElementById('settingsResourceList');
+            if (!target) return;
+            if (!resources.length) {
+                target.innerHTML = this.empty('暂无资源版本，导入数据、知识文档或报告模板后将在这里显示历史');
+                return;
+            }
+            const typeLabels = { data: '成本数据', knowledge: '知识文档', template: '报告模板' };
+            const groups = new Map();
+            resources.forEach(resource => {
+                const groupKey = `${resource.resource_type}:${resource.logical_key}`;
+                if (!groups.has(groupKey)) groups.set(groupKey, []);
+                groups.get(groupKey).push(resource);
+            });
+            target.innerHTML = Array.from(groups.entries()).map(([groupKey, versions]) => {
+                const [resourceType, logicalKey] = groupKey.split(':');
+                const title = resourceType === 'data'
+                    ? (this.summary?.data_files?.find(file => file.key === logicalKey)?.label || logicalKey)
+                    : resourceType === 'template' ? '默认报告模板' : `知识文档：${logicalKey}`;
+                return `<div class="settings-resource-group">
+                  <div class="settings-resource-group-title"><span>${Utils.escapeHtml(typeLabels[resourceType] || resourceType)}</span><strong>${Utils.escapeHtml(title)}</strong></div>
+                  <div class="settings-resource-versions">${versions.map(resource => this.resourceRow(resource)).join('')}</div>
+                </div>`;
+            }).join('');
+        },
+
+        resourceRow(resource) {
+            const active = resource.status === 'active';
+            const status = active ? '<span class="settings-resource-status active">当前使用</span>' : '<span class="settings-resource-status">历史版本</span>';
+            const date = resource.published_at || resource.created_at || '';
+            const hash = resource.sha256 ? `${resource.sha256.slice(0, 10)}...` : '';
+            const validation = resource.validation?.valid === false ? '校验失败' : '已校验';
+            const rollback = active ? '' : `<button class="settings-resource-button" type="button" title="将此版本恢复为当前版本" data-resource-action="rollback" data-resource-id="${Utils.escapeHtml(resource.resource_id)}"><i data-lucide="rotate-ccw"></i>回滚</button>`;
+            const remove = active ? '' : `<button class="settings-resource-button danger" type="button" title="删除历史版本" data-resource-action="delete" data-resource-id="${Utils.escapeHtml(resource.resource_id)}"><i data-lucide="trash-2"></i>删除</button>`;
+            return `<div class="settings-resource-row">
+              <div class="settings-resource-version"><strong>v${resource.version}</strong>${status}</div>
+              <div class="settings-resource-meta"><span>${Utils.escapeHtml(resource.filename || '')}</span><small>${Utils.escapeHtml(date)} · ${Utils.escapeHtml(hash)} · ${validation}</small></div>
+              <div class="settings-resource-actions">${rollback}${remove}</div>
+            </div>`;
+        },
+
         fileRow(file, actions = '') {
             const state = file.imported ? '<span class="settings-file-badge imported">已导入</span>' : '<span class="settings-file-badge">默认</span>';
             const version = file.version ? ` · 版本 v${file.version}` : '';
@@ -165,6 +229,16 @@
 
         async handleClick(event) {
             const button = event.target.closest('[data-delete-type]');
+            const resourceButton = event.target.closest('[data-resource-action]');
+            if (resourceButton) {
+                const action = resourceButton.dataset.resourceAction;
+                const id = resourceButton.dataset.resourceId;
+                const prompt = action === 'rollback' ? '确认将此历史版本恢复为当前版本？' : '确认删除此历史资源版本？删除后不可恢复。';
+                if (!window.confirm(prompt)) return;
+                const endpoint = `/api/settings/resources/${encodeURIComponent(id)}/${action}`;
+                await this.action(endpoint, action === 'rollback' ? '资源已回滚' : '历史版本已删除', action === 'rollback' ? 'POST' : 'DELETE');
+                return;
+            }
             if (!button) return;
             if (!window.confirm(button.dataset.confirm || '确认删除该导入文件？')) return;
             const type = button.dataset.deleteType;
@@ -184,6 +258,7 @@
                 const data = await response.json().catch(() => ({}));
                 if (!response.ok) throw new Error(data.detail || data.message || `HTTP ${response.status}`);
                 this.render(data.summary || await Utils.api('/api/settings/summary'));
+                await this.refreshResourceListSilently();
                 this.message(data.message || '文件导入成功', 'success');
                 if (endpoint.includes('/data/')) await this.refreshApplicationData();
             } catch (error) {
@@ -204,6 +279,7 @@
                 const data = await response.json().catch(() => ({}));
                 if (!response.ok) throw new Error(data.detail || data.message || `HTTP ${response.status}`);
                 this.render(data.summary || await Utils.api('/api/settings/summary'));
+                await this.refreshResourceListSilently();
                 this.message(data.message || fallbackMessage, 'success');
                 if (endpoint.includes('data')) await this.refreshApplicationData();
             } catch (error) {
@@ -214,6 +290,17 @@
         async refreshApplicationData() {
             await Selectors.loadProducts();
             Router.renderPage(AppState.currentPage);
+        },
+
+        async refreshResourceListSilently() {
+            try {
+                const data = await Utils.api('/api/settings/resources', { timeoutMs: 20000 });
+                this.resources = data.resources || [];
+                this.renderResources(this.resources);
+                refreshIcons();
+            } catch (error) {
+                console.warn('资源版本刷新失败', error);
+            }
         },
 
         message(text, type = '') {
