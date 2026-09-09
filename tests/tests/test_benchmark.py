@@ -34,9 +34,9 @@ variant = """一、结论摘要（整体判断）
 2. 复核人工效率"""
 normalized = _normalize_model_attribution(variant)
 assert normalized is not None
-assert normalized.startswith("## 结论摘要")
-assert "## 重点分析" in normalized
-assert "## 改进建议" in normalized
+assert normalized.startswith("1. 结论摘要")
+assert "2. 重点分析" in normalized
+assert "3. 改进建议" in normalized
 assert _normalize_model_attribution(
     "### 结论摘要\n摘要\n### 重点分析\n- 差异\n### 改进建议\n- 核查"
 ) is not None
@@ -89,8 +89,9 @@ with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             else:
                 sys.modules[name] = module
 
-assert "## 结论摘要" in attribution["attribution"]
-assert "## 改进建议" in attribution["attribution"]
+assert "1. 结论摘要" in attribution["attribution"]
+assert "3. 改进建议" in attribution["attribution"]
+assert "##" not in attribution["attribution"]
 assert attribution["suggestions"]
 assert {"suggestion", "department", "priority", "deadline"} <= set(attribution["suggestions"][0])
 assert attribution["rag_sources"] == ["工艺文档"]
@@ -103,7 +104,7 @@ import rpa.client as rpa_client
 from rpa.task_store import TaskStore
 
 
-async def test_benchmark_task_generation_and_dispatch():
+async def _benchmark_task_generation_and_dispatch():
     generated_items = [
         {"task_title": "核查原材料采购价格", "priority": "high"},
         {"task_title": "复核生产工时效率", "priority": "medium"},
@@ -126,7 +127,7 @@ original_store = rpa_client.TASK_STORE
 with tempfile.TemporaryDirectory() as directory:
     rpa_client.TASK_STORE = TaskStore(Path(directory) / "tasks.sqlite3")
     try:
-        dispatch_result = asyncio.run(test_benchmark_task_generation_and_dispatch())
+        dispatch_result = asyncio.run(_benchmark_task_generation_and_dispatch())
     finally:
         rpa_client.TASK_STORE = original_store
 assert dispatch_result["tasks_dispatched"] == 2

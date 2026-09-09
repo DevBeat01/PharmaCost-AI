@@ -50,10 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # 三、项目内部模块导入
 # ============================================================
 
-from config import (
-    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_VERIFY_SSL,
-    MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, MIMO_VERIFY_SSL,
-)
+import config
 # 【批量导入】从 config 模块一次导入多个变量
 # 等价于：from config import LLM_PROVIDER
 #         from config import DEEPSEEK_API_KEY
@@ -103,27 +100,23 @@ class LLMClient:
         self.last_provider = None
         self._providers = []
 
-        # 顺序固定为 DeepSeek 主模型、MiMo 备用模型。只有配置了密钥的
-        # 提供商才会加入候选列表，避免空密钥请求遮蔽真正的备用模型。
-        if DEEPSEEK_API_KEY:
-            self._providers.append((
-                "deepseek", DEEPSEEK_MODEL,
-                OpenAI(
-                    api_key=DEEPSEEK_API_KEY,
-                    base_url=DEEPSEEK_BASE_URL,
-                    http_client=httpx.Client(verify=DEEPSEEK_VERIFY_SSL, timeout=60.0),
-                ),
-            ))
-        if MIMO_API_KEY:
-            self._providers.append((
-                "mimo", MIMO_MODEL,
-                OpenAI(
-                    api_key=MIMO_API_KEY,
-                    base_url=MIMO_BASE_URL,
-                    # 本地环境可通过 MIMO_VERIFY_SSL=false 兼容受管终端的证书链问题。
-                    http_client=httpx.Client(verify=MIMO_VERIFY_SSL, timeout=60.0),
-                ),
-            ))
+        provider_configs = {
+            "deepseek": (config.DEEPSEEK_API_KEY, config.DEEPSEEK_MODEL, config.DEEPSEEK_BASE_URL, config.DEEPSEEK_VERIFY_SSL),
+            "mimo": (config.MIMO_API_KEY, config.MIMO_MODEL, config.MIMO_BASE_URL, config.MIMO_VERIFY_SSL),
+        }
+        provider_order = ["deepseek", "mimo"]
+        # 只有配置了密钥的提供商才会加入候选列表，避免空密钥请求遮蔽真正的备用模型。
+        for provider in provider_order:
+            api_key, model, base_url, verify_ssl = provider_configs[provider]
+            if api_key:
+                self._providers.append((
+                    provider, model,
+                    OpenAI(
+                        api_key=api_key,
+                        base_url=base_url,
+                        http_client=httpx.Client(verify=verify_ssl, timeout=60.0),
+                    ),
+                ))
 
         if self._providers:
             self.provider, self.model, self.client = self._providers[0]
@@ -136,6 +129,15 @@ class LLMClient:
         else:
             self.client = None
             logger.warning("未配置 DeepSeek 或 MiMo API 密钥，文本生成将使用业务兜底")
+
+    def reload(self):
+        """Reload provider clients after a runtime settings change."""
+        for _, _, client in self._providers:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.__init__()
 
     def _chat_once(self, messages, max_tokens):
         if not self._providers:
@@ -198,7 +200,7 @@ class LLMClient:
 
         return self._chat_once(messages, max_tokens)
 
-    def chat_stream(self, prompt: str, system: str = ""):
+    def chat_stream(self, prompt: str, system: str = "", max_tokens: int = 4000):
         """
         流式聊天调用——边生成边返回，实现"打字机"效果。
 
@@ -240,7 +242,7 @@ class LLMClient:
             yielded = False
             try:
                 stream = client.chat.completions.create(
-                    model=model, messages=messages, max_tokens=4000,
+                    model=model, messages=messages, max_tokens=max_tokens,
                     temperature=0.3, stream=True,
                 )
                 for chunk in stream:

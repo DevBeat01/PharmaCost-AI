@@ -42,6 +42,15 @@ Copy-Item app/.env.example app/.env
 E:\Anacounda\python.exe -m pip install -r app/requirements.txt
 ```
 
+## 评审一键启动（Windows）
+
+评委只需准备比赛数据包并双击项目根目录的 `start_all.bat`。脚本会自动检查 Python、首次安装依赖、启动主应用和模拟 RPA 服务，等待健康检查通过后自动打开浏览器。
+
+- 默认使用 `E:\Anacounda\python.exe`；其他环境可将 `PHARMACOST_PYTHON` 设置为 Python 完整路径后再双击。
+- 首次安装依赖和首次下载本地嵌入模型需要网络；后续启动复用已安装依赖和本地索引。
+- 不配置模型 API Key 时，基础数据看板和对标数据仍可使用；AI 归因、任务生成和智能报告需在 `app/.env` 配置可用密钥。
+- 服务启动后访问 <http://127.0.0.1:8000>；关闭两个标题为 `PharmaCost-Web` 与 `RPA-Server` 的命令窗口即可停止服务。
+
 ## 本地启动
 
 在项目根目录运行 `start_all.bat`，它会启动：

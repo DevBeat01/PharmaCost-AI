@@ -11,8 +11,9 @@ def normalize_markdown_text(text: str) -> str:
     value = re.sub(r'```(?:\w+)?\s*\n?', '', value)
     value = re.sub(r'```', '', value)
     value = re.sub(r'^\s{0,3}#{1,6}\s*', '', value, flags=re.MULTILINE)
+    value = re.sub(r'^\s*>\s?', '', value, flags=re.MULTILINE)
     value = re.sub(r'^\s*[-*+]\s+', '• ', value, flags=re.MULTILINE)
-    value = re.sub(r'^\s*\d+[.)]\s+', '', value, flags=re.MULTILINE)
+    value = re.sub(r'^\s*\d+[.)]\s+', '• ', value, flags=re.MULTILINE)
     value = re.sub(
         r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',
         '', value, flags=re.MULTILINE)
@@ -35,8 +36,10 @@ def normalize_markdown_text(text: str) -> str:
         kept.append(line)
     value = '\n'.join(kept)
     value = re.sub(r'^\s*[-*_]{3,}\s*$', '', value, flags=re.MULTILINE)
+    value = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', value)
     value = re.sub(r'\*\*(.*?)\*\*', r'\1', value, flags=re.DOTALL)
     value = re.sub(r'__(.*?)__', r'\1', value, flags=re.DOTALL)
+    value = re.sub(r'~~(.*?)~~', r'\1', value, flags=re.DOTALL)
     value = re.sub(r'(?<!\*)\*(?!\s)(.*?)(?<!\s)\*', r'\1', value)
     value = re.sub(r'(?<!_)_(?!\s)(.*?)(?<!\s)_', r'\1', value)
     value = re.sub(r'`([^`]+)`', r'\1', value)

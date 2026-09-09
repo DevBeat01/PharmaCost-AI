@@ -2,12 +2,23 @@
 import json
 import sys
 import threading
+import queue
+import time
+import logging
+import re
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.cost_data import cost_service
 from config import ALERT_THRESHOLD, MONTHS, PRODUCTS
+
+logger = logging.getLogger("analysis.dashboard")
+
+_RAG_TIMEOUT_SECONDS = 4.0
+# 首次模型加载及网络首包可能较慢；前端 SSE 超时同为 90 秒，服务端不应提前中断。
+_LLM_STREAM_TIMEOUT_SECONDS = 90.0
+_FOCUS_METRIC_NAMES = ("单位成本", "总成本", "直接材料", "直接人工", "制造费用")
 
 # 归因结果按产品和月份缓存，避免同一看板参数重复调用模型。
 _ATTRIBUTION_CACHE: dict[tuple[str, str], dict] = {}
@@ -19,6 +30,78 @@ def _attribution_lock(cache_key: tuple[str, str]) -> threading.Lock:
     """为每个产品/月提供独立锁，避免并发请求重复调用模型。"""
     with _ATTRIBUTION_LOCKS_GUARD:
         return _ATTRIBUTION_CACHE_LOCKS.setdefault(cache_key, threading.Lock())
+
+
+def _focus_alerts(data: dict) -> list[dict]:
+    """Return threshold alerts that represent costs, excluding production-only changes."""
+    return [
+        alert for alert in data.get('alerts', [])
+        if any(name in str(alert.get('metric', '')) for name in _FOCUS_METRIC_NAMES)
+    ]
+
+
+def _focus_analysis_section(data: dict, waterfall: dict, material: dict) -> str:
+    """Build a data-backed section that is present whenever a cost alert fires."""
+    alerts = _focus_alerts(data)
+    if not alerts:
+        return ''
+
+    rows = {row.get('metric'): row for row in data.get('rows', [])}
+    lines = ["## 重点分析"]
+    for alert in alerts:
+        metric = str(alert.get('metric') or '成本要素')
+        row = rows.get(metric, {})
+        change = float(alert.get('change') or 0)
+        direction = '上涨' if change > 0 else '下降'
+        current = row.get('current')
+        previous = row.get('last_month')
+        value_text = (
+            f"本月{float(current):.2f}，上月{float(previous):.2f}"
+            if current is not None and previous is not None else "本月与上月数据需进一步核对"
+        )
+        verification = "请核查对应明细、原始凭证及成本分摊口径。"
+        if '直接材料' in metric:
+            top_material = (material.get('materials') or [None])[0]
+            if top_material:
+                verification = (
+                    f"重点核查{top_material.get('material_name', '主要原材料')}的采购单价、领料单价和单位消耗；"
+                    "其余材料及工艺单耗也需进一步核查。"
+                )
+            else:
+                verification = "重点核查采购单价、领料单价、投料量和单位消耗。"
+        elif '直接人工' in metric:
+            verification = "重点核查工时、工资率、人员配置和产量摊薄情况。"
+        elif '制造费用' in metric:
+            verification = "重点核查能耗、维修、设备运行记录及费用分摊表。"
+        elif '总成本' in metric:
+            verification = "重点核查直接材料、直接人工、制造费用明细以及产量变化对总额的影响。"
+        else:
+            verification = "重点核查直接材料、直接人工、制造费用明细及其成本分摊口径。"
+        lines.append(
+            f"- {metric}{value_text}，环比{direction}{abs(change):.2f}%，已超过±{ALERT_THRESHOLD:.0f}%阈值。{verification}"
+        )
+    return '\n\n'.join(lines)
+
+
+def _ensure_focus_analysis(text: str, data: dict, waterfall: dict, material: dict) -> str:
+    """Guarantee a correct focus section even when the LLM omits or misformats it."""
+    focus_section = _focus_analysis_section(data, waterfall, material)
+    if not focus_section:
+        return text
+
+    text = str(text or '').strip()
+    focus_heading = re.compile(r"(?m)^#{1,3}\s*重点分析\s*$")
+    suggestion_heading = re.compile(r"(?m)^#{1,3}\s*改进建议\s*$")
+    match = focus_heading.search(text)
+    if match:
+        next_heading = re.search(r"(?m)^#{1,3}\s+\S", text[match.end():])
+        end = match.end() + next_heading.start() if next_heading else len(text)
+        return f"{text[:match.start()].rstrip()}\n\n{focus_section}\n\n{text[end:].lstrip()}".strip()
+
+    match = suggestion_heading.search(text)
+    if match:
+        return f"{text[:match.start()].rstrip()}\n\n{focus_section}\n\n{text[match.start():].lstrip()}".strip()
+    return f"{text}\n\n{focus_section}".strip()
 
 
 def three_dim_compare(product: str, month: str) -> dict:
@@ -217,6 +300,7 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
         'waterfall': waterfall,
         'material_detail': material,
     }
+    focus_required = bool(_focus_alerts(data))
     fallback = _build_attribution_fallback(data, waterfall, material)
     cached = None if force else _ATTRIBUTION_CACHE.get(cache_key)
     if cached:
@@ -225,8 +309,11 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
             'month': month,
             'data': context,
             'alerts': data.get('alerts', []),
-            '重点分析': bool(data.get('alerts')),
-            'analysis': cached['analysis'] if cached.get('rag_sources') else _append_data_only_notice(cached['analysis']),
+            '重点分析': focus_required,
+            'analysis': _ensure_focus_analysis(
+                cached['analysis'] if cached.get('rag_sources') else _append_data_only_notice(cached['analysis']),
+                data, waterfall, material,
+            ),
             'analysis_source': cached.get('source', 'ai'),
             'rag_sources': cached.get('rag_sources', []),
             'rag_used': bool(cached.get('rag_sources')),
@@ -243,15 +330,18 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
                 'month': month,
                 'data': context,
                 'alerts': data.get('alerts', []),
-                '重点分析': bool(data.get('alerts')),
-                'analysis': cached['analysis'] if cached.get('rag_sources') else _append_data_only_notice(cached['analysis']),
+                '重点分析': focus_required,
+                'analysis': _ensure_focus_analysis(
+                    cached['analysis'] if cached.get('rag_sources') else _append_data_only_notice(cached['analysis']),
+                    data, waterfall, material,
+                ),
                 'analysis_source': cached.get('source', 'ai'),
                 'rag_sources': cached.get('rag_sources', []),
                 'rag_used': bool(cached.get('rag_sources')),
                 'knowledge_base_version': 'knowledge_index_meta',
                 'cached': True,
             }
-        rag_results = _dashboard_rag_results(product, month, data, material) if data.get('alerts') else []
+        rag_results = _dashboard_rag_results(product, month, data, material) if focus_required else []
         rag_sources = _rag_source_names(rag_results)
         rag_context = '\n'.join(
             f"[{index + 1}] [来源：{result.get('source', '知识库')}] {result.get('content', '')[:500]}"
@@ -281,6 +371,7 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
             text = _append_rag_sources(text, used_rag_sources)
         else:
             text = _append_data_only_notice(text)
+        text = _ensure_focus_analysis(text, data, waterfall, material)
         # 仅缓存模型生成结果；临时网络/超时兜底文本不应污染后续切换结果。
         if source == 'ai':
             _ATTRIBUTION_CACHE[cache_key] = {'analysis': text, 'source': source, 'rag_sources': used_rag_sources}
@@ -289,7 +380,7 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
         'month': month,
         'data': context,
         'alerts': data.get('alerts', []),
-        '重点分析': bool(data.get('alerts')),
+        '重点分析': focus_required,
         'analysis': text,
         'analysis_source': source,
         'rag_sources': used_rag_sources,
@@ -297,6 +388,178 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
         'knowledge_base_version': 'knowledge_index_meta',
         'cached': False,
     }
+
+
+def dashboard_attribution_stream(product: str, month: str, force: bool = False):
+    """以 SSE 事件片段生成看板归因，任何依赖失败都保证返回规则兜底。"""
+    cache_key = (product, month)
+    context = None
+    fallback = "## 归因分析\n\n当前成本数据暂时不可用，请稍后重试。"
+    try:
+        data = three_dim_compare(product, month)
+        if data.get('error'):
+            yield {'event': 'complete', 'data': data}
+            return
+        waterfall = cost_waterfall(product, month)
+        material = material_detail_table(product, month)
+        context = {'dashboard': data, 'waterfall': waterfall, 'material_detail': material}
+        focus_required = bool(_focus_alerts(data))
+        fallback = _build_attribution_fallback(data, waterfall, material)
+    except Exception:
+        logger.exception("归因基础数据准备失败: product=%s month=%s", product, month)
+        yield {'event': 'meta', 'data': {'product': product, 'month': month, 'alerts': [], '重点分析': False, 'rag_sources': []}}
+        yield {'event': 'chunk', 'data': {'text': fallback}}
+        yield {'event': 'complete', 'data': {
+            'product': product, 'month': month, 'analysis': fallback,
+            'analysis_source': 'fallback', 'alerts': [], '重点分析': False,
+            'rag_sources': [], 'rag_used': False, 'data': {}, 'cached': False,
+        }}
+        return
+
+    def result_payload(text, source, rag_sources, cached):
+        return {
+            'product': product, 'month': month, 'data': context,
+            'alerts': data.get('alerts', []), '重点分析': focus_required,
+            'analysis': text, 'analysis_source': source,
+            'rag_sources': rag_sources, 'rag_used': bool(rag_sources),
+            'knowledge_base_version': 'knowledge_index_meta', 'cached': cached,
+        }
+
+    def replay(text):
+        for start in range(0, len(text), 32):
+            yield {'event': 'chunk', 'data': {'text': text[start:start + 32]}}
+
+    # 基础数据准备完就通知前端，避免在RAG/模型初始化期间一直显示加载。
+    yield {'event': 'meta', 'data': {
+        'product': product, 'month': month, 'alerts': data.get('alerts', []),
+        '重点分析': focus_required, 'rag_sources': [],
+    }}
+
+    cached = None if force else _ATTRIBUTION_CACHE.get(cache_key)
+    if cached:
+        text = _ensure_focus_analysis(
+            cached['analysis'] if cached.get('rag_sources') else _append_data_only_notice(cached['analysis']),
+            data, waterfall, material,
+        )
+        yield from replay(text)
+        yield {'event': 'complete', 'data': result_payload(text, cached.get('source', 'ai'), cached.get('rag_sources', []), True)}
+        return
+
+    with _attribution_lock(cache_key):
+        cached = None if force else _ATTRIBUTION_CACHE.get(cache_key)
+        if cached:
+            text = _ensure_focus_analysis(
+                cached['analysis'] if cached.get('rag_sources') else _append_data_only_notice(cached['analysis']),
+                data, waterfall, material,
+            )
+            yield from replay(text)
+            yield {'event': 'complete', 'data': result_payload(text, cached.get('source', 'ai'), cached.get('rag_sources', []), True)}
+            return
+
+        # RAG不是归因生成的必要条件，超过短时限即按无知识库处理。
+        rag_results = _run_with_timeout(
+            lambda: _dashboard_rag_results(product, month, data, material),
+            _RAG_TIMEOUT_SECONDS,
+            default=[],
+        ) if focus_required else []
+        rag_sources = _rag_source_names(rag_results)
+        rag_context = '\n'.join(
+            f"[{index + 1}] [来源：{result.get('source', '知识库')}] {result.get('content', '')[:500]}"
+            for index, result in enumerate(rag_results)
+        )
+        source = 'fallback'
+        text = ''
+        streamed_text = False
+        model_failed = False
+        try:
+            from llm.prompts import DASHBOARD_ATTRIBUTION_PROMPT, SYSTEM_ROLE
+            prompt = DASHBOARD_ATTRIBUTION_PROMPT.format(
+                product=product, month=month,
+                context=json.dumps(context, ensure_ascii=False, indent=2),
+                rag_context=rag_context or '本次无阈值告警，不使用知识库。',
+            )
+            for chunk in _model_stream_with_timeout(
+                prompt, SYSTEM_ROLE, _LLM_STREAM_TIMEOUT_SECONDS, max_tokens=1800
+            ):
+                if chunk:
+                    text += str(chunk)
+                    streamed_text = True
+                    yield {'event': 'chunk', 'data': {'text': str(chunk)}}
+            if not text.strip():
+                raise RuntimeError('模型未返回归因文本')
+            source = 'ai'
+        except Exception as exc:
+            logger.warning("归因模型调用失败，使用规则兜底: product=%s month=%s error=%s", product, month, exc)
+            model_failed = True
+            text = fallback
+            source = 'fallback'
+        text = text or fallback
+        used_rag_sources = rag_sources if source == 'ai' else []
+        text = _append_rag_sources(text, used_rag_sources) if used_rag_sources else _append_data_only_notice(text)
+        text = _ensure_focus_analysis(text, data, waterfall, material)
+        if source == 'ai':
+            _ATTRIBUTION_CACHE[cache_key] = {'analysis': text, 'source': source, 'rag_sources': used_rag_sources}
+        # 模型在首个chunk前失败时也补发完整文本，前端不会只看到空白。
+        if source == 'fallback' and (model_failed or not streamed_text):
+            yield from replay(text)
+        yield {'event': 'complete', 'data': result_payload(text, source, used_rag_sources, False)}
+
+
+def _run_with_timeout(fn, timeout: float, default):
+    """在守护线程执行可能阻塞的依赖调用，超时后立即返回默认值。"""
+    result_queue = queue.Queue(maxsize=1)
+
+    def worker():
+        try:
+            result_queue.put((True, fn()), block=False)
+        except Exception as exc:
+            result_queue.put((False, exc), block=False)
+
+    threading.Thread(target=worker, daemon=True, name="dashboard-attribution-dependency").start()
+    try:
+        ok, value = result_queue.get(timeout=timeout)
+        return value if ok else default
+    except queue.Empty:
+        logger.warning("归因依赖调用超时（%.1fs）", timeout)
+        return default
+
+
+def _model_stream_with_timeout(prompt: str, system: str, timeout: float, max_tokens: int = 1800):
+    """消费LLM流式响应并设置总超时，避免SSE连接无限等待。"""
+    result_queue = queue.Queue(maxsize=128)
+
+    def worker():
+        try:
+            from llm.client import llm_client
+            for chunk in llm_client.chat_stream(prompt, system=system, max_tokens=max_tokens):
+                if chunk:
+                    try:
+                        result_queue.put(('chunk', str(chunk)), timeout=0.2)
+                    except queue.Full:
+                        return
+            result_queue.put(('done', None), timeout=0.2)
+        except Exception as exc:
+            try:
+                result_queue.put(('error', exc), timeout=0.2)
+            except queue.Full:
+                pass
+
+    threading.Thread(target=worker, daemon=True, name="dashboard-attribution-llm").start()
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"模型流式调用超过{timeout:.0f}秒")
+        try:
+            kind, value = result_queue.get(timeout=min(0.5, remaining))
+        except queue.Empty:
+            continue
+        if kind == 'chunk':
+            yield value
+        elif kind == 'done':
+            return
+        else:
+            raise value
 
 
 def _dashboard_rag_results(product: str, month: str, data: dict, material: dict) -> list[dict]:
@@ -359,7 +622,7 @@ def _build_attribution_fallback(data: dict, waterfall: dict, material: dict) -> 
     ]
     factors = [item for item in waterfall.get('items', []) if not item.get('is_total')]
     factors.sort(key=lambda item: abs(item.get('value', 0)), reverse=True)
-    parts.append("## 重点分析" if data.get('alerts') else "## 常规分析")
+    parts.append("## 重点分析" if _focus_alerts(data) else "## 常规分析")
     for item in factors:
         pct = item.get('contribution_pct')
         pct_text = f"贡献总变动的{pct:.1f}%" if pct is not None else "贡献度无法计算"

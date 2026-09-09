@@ -10,11 +10,14 @@ from pathlib import Path
 import pandas as pd
 from docx import Document
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
 
 from config import (
     CUSTOM_TEMPLATE_PATH, DATA_FILE_DEFAULTS, DATA_SOURCE_CONFIG_PATH,
     DATA_UPLOAD_DIR, KNOWLEDGE_DIR, KNOWLEDGE_UPLOAD_DIR, TEMPLATE_DOCX,
-    TEMPLATE_UPLOAD_DIR, get_data_file, get_report_template_path,
+    TEMPLATE_UPLOAD_DIR, MODEL_CONFIG_PATH, get_data_file, get_report_template_path,
+    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_VERIFY_SSL, DEEPSEEK_PROVIDER_LABEL,
+    MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, MIMO_VERIFY_SSL, MIMO_PROVIDER_LABEL,
 )
 from data.cost_data import cost_service
 
@@ -30,6 +33,18 @@ DATA_FILE_LABELS = {
     "benchmark_2025": "对标工厂成本汇总（上年）",
     "market": "行业市场价格行情", "industry": "行业成本基准",
 }
+
+class ModelConfigPayload(BaseModel):
+    deepseek_provider_label: str | None = None
+    deepseek_api_key: str | None = None
+    deepseek_base_url: str | None = None
+    deepseek_model: str | None = None
+    deepseek_verify_ssl: bool | None = None
+    mimo_provider_label: str | None = None
+    mimo_api_key: str | None = None
+    mimo_base_url: str | None = None
+    mimo_model: str | None = None
+    mimo_verify_ssl: bool | None = None
 
 
 def _safe_filename(name: str | None) -> str:
@@ -65,6 +80,29 @@ def _write_overrides(data: dict) -> None:
     temp = DATA_SOURCE_CONFIG_PATH.with_suffix(".tmp")
     temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(DATA_SOURCE_CONFIG_PATH)
+
+def _read_model_overrides() -> dict:
+    try:
+        data = json.loads(MODEL_CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def _write_model_overrides(data: dict) -> None:
+    MODEL_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp = MODEL_CONFIG_PATH.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(MODEL_CONFIG_PATH)
+
+def _mask_key(value: str) -> str:
+    value = str(value or "")
+    return (value[:4] + "*" * max(4, len(value) - 8) + value[-4:]) if len(value) > 8 else ("已配置" if value else "未配置")
+
+def _model_summary() -> dict:
+    return {
+        "deepseek": {"provider_label": DEEPSEEK_PROVIDER_LABEL, "api_key": _mask_key(DEEPSEEK_API_KEY), "configured": bool(DEEPSEEK_API_KEY), "base_url": DEEPSEEK_BASE_URL, "model": DEEPSEEK_MODEL, "verify_ssl": DEEPSEEK_VERIFY_SSL},
+        "mimo": {"provider_label": MIMO_PROVIDER_LABEL, "api_key": _mask_key(MIMO_API_KEY), "configured": bool(MIMO_API_KEY), "base_url": MIMO_BASE_URL, "model": MIMO_MODEL, "verify_ssl": MIMO_VERIFY_SSL},
+    }
 
 
 def _file_info(path: Path, *, deletable: bool, key: str | None = None, label: str | None = None) -> dict:
@@ -116,14 +154,56 @@ def _summary() -> dict:
         "system": {
             "data_loaded": cost_service._loaded,
             "rag": rag,
-            "text_model": "DeepSeek（主）/ MiMo（备用）",
+            "text_model": f"{DEEPSEEK_PROVIDER_LABEL}（主）/ {MIMO_PROVIDER_LABEL}（备用）",
         },
+        "models": _model_summary(),
     }
 
 
 @router.get("/summary")
 async def settings_summary():
     return _summary()
+
+@router.put("/models")
+async def update_models(payload: ModelConfigPayload):
+    values = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") else payload.dict(exclude_unset=True)
+    mapping = {"deepseek_provider_label":"DEEPSEEK_PROVIDER_LABEL", "deepseek_api_key":"DEEPSEEK_API_KEY", "deepseek_base_url":"DEEPSEEK_BASE_URL", "deepseek_model":"DEEPSEEK_MODEL", "deepseek_verify_ssl":"DEEPSEEK_VERIFY_SSL", "mimo_provider_label":"MIMO_PROVIDER_LABEL", "mimo_api_key":"MIMO_API_KEY", "mimo_base_url":"MIMO_BASE_URL", "mimo_model":"MIMO_MODEL", "mimo_verify_ssl":"MIMO_VERIFY_SSL"}
+    updates = {}
+    for key, value in values.items():
+        config_key = mapping[key]
+        if key.endswith("_api_key") and value == "":
+            continue
+        if isinstance(value, str): value = value.strip()
+        if config_key.endswith("_BASE_URL") and value and not str(value).startswith(("http://", "https://")):
+            raise HTTPException(422, "接口地址必须以 http:// 或 https:// 开头")
+        if config_key.endswith("_MODEL") and not value:
+            raise HTTPException(422, "模型名称不能为空")
+        updates[config_key] = value
+    current = _read_model_overrides(); current.update(updates); _write_model_overrides(current)
+    try:
+        import importlib, config as config_module
+        importlib.reload(config_module)
+        for name in ('DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL', 'DEEPSEEK_VERIFY_SSL', 'DEEPSEEK_PROVIDER_LABEL', 'MIMO_API_KEY', 'MIMO_BASE_URL', 'MIMO_MODEL', 'MIMO_VERIFY_SSL', 'MIMO_PROVIDER_LABEL'):
+            globals()[name] = getattr(config_module, name)
+        from llm.client import llm_client
+        llm_client.reload()
+    except Exception as exc:
+        raise HTTPException(500, f"配置已保存，但模型客户端重载失败: {exc}") from exc
+    return {"message": "模型配置已保存并生效", "summary": _summary()}
+
+@router.delete("/models")
+async def reset_models():
+    MODEL_CONFIG_PATH.unlink(missing_ok=True)
+    try:
+        import importlib, config as config_module
+        importlib.reload(config_module)
+        for name in ('DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL', 'DEEPSEEK_VERIFY_SSL', 'DEEPSEEK_PROVIDER_LABEL', 'MIMO_API_KEY', 'MIMO_BASE_URL', 'MIMO_MODEL', 'MIMO_VERIFY_SSL', 'MIMO_PROVIDER_LABEL'):
+            globals()[name] = getattr(config_module, name)
+        from llm.client import llm_client
+        llm_client.reload()
+    except Exception as exc:
+        raise HTTPException(500, f"配置已恢复，但模型客户端重载失败: {exc}") from exc
+    return {"message": "模型配置已恢复为环境变量设置", "summary": _summary()}
 
 
 @router.post("/data/{key}")

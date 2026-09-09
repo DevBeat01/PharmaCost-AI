@@ -99,7 +99,7 @@ def test_benchmark_suggestions_keep_distinct_task_titles():
 def test_benchmark_generation_calls_ai_before_structured_suggestion_fallback():
     async def run():
         with patch.object(client, "_generate_llm_tasks", new_callable=AsyncMock, return_value=[
-            {"task_title": "AI生成的对标整改任务", "priority": "high"},
+            {"task_title": "复核原材料采购入库价与合同单价差异", "priority": "high"},
         ]) as generate:
             result = await client.generate_task_drafts(
                 "银黄口服液", "2026-06", "benchmark_attribution", "对标差异结论", {
@@ -108,9 +108,27 @@ def test_benchmark_generation_calls_ai_before_structured_suggestion_fallback():
             )
         assert generate.await_count == 1
         assert result["generation_source"] == "ai"
-        assert result["tasks"][0]["task_title"] == "AI生成的对标整改任务"
+        assert result["tasks"][0]["task_title"] == "复核原材料采购入库价与合同单价差异"
 
     with_temporary_store(lambda _: asyncio.run(run()))
+
+
+def test_vague_ai_tasks_are_rejected_and_replaced_with_executable_drafts():
+    async def run():
+        with patch.object(client, "_generate_llm_tasks", new_callable=AsyncMock, return_value=[
+            {"task_title": "加强成本管理", "deadline": "2026-01-01"},
+            {"task_title": "持续关注成本变化"},
+        ]):
+            return await client.generate_task_drafts(
+                "银黄口服液", "2026-06", "dashboard_attribution", "直接材料采购价格异常", {},
+            )
+
+    result = with_temporary_store(lambda _: asyncio.run(run()))
+    assert result["generation_source"] == "fallback"
+    assert result["rejected_tasks"] == 2
+    assert result["tasks"]
+    assert all(client._is_executable_task(task) for task in result["tasks"])
+    assert all(task["assignee"]["department"] and task["assignee"]["role"] for task in result["tasks"])
 
 
 def test_only_selected_draft_is_dispatched_without_wechat_notification():

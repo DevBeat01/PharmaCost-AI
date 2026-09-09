@@ -30,6 +30,14 @@ SCENARIO_NAMES = {
     "benchmark_attribution": "成本对标归因分析",
 }
 
+# 任务标题必须能落到可核查的业务对象，避免把“加强管理”等口号直接派发。
+_TASK_ACTION_RE = re.compile(r"(核查|复核|比对|检查|确认|提取|汇总|分析|制定|建立|落实|整改|补充|验证|跟进|优化|共享|清理)")
+_TASK_OBJECT_RE = re.compile(
+    r"(采购|原材料|药材|供应商|报价|合同|入库价|领料单|投料|单耗|收率|工时|排班|加班|人员|"
+    r"设备|能耗|维修|费用分摊|分摊表|成本明细|会计凭证|费用科目|产量|工艺参数|运行记录)"
+)
+_TASK_VAGUE_RE = re.compile(r"(加强管理|持续关注|密切关注|提高意识|优化成本|降本增效|提升能力|协同推进|做好.*工作)")
+
 # 任务草稿与派发状态持久化到 SQLite，应用重启后仍可继续处理。
 TASK_STORE = TaskStore(RPA_TASK_DB_PATH)
 
@@ -41,7 +49,10 @@ def _unwrap_response(payload: dict) -> dict:
 
 
 def _deadline_for_month(month: str, days: int = 30) -> str:
-    return (datetime.strptime(month + "-28", "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
+    """为历史分析也生成尚未逾期、可执行的截止日。"""
+    report_deadline = (datetime.strptime(month + "-28", "%Y-%m-%d") + timedelta(days=days)).date()
+    earliest_deadline = (datetime.now().date() + timedelta(days=7))
+    return max(report_deadline, earliest_deadline).isoformat()
 
 
 def _determine_assignee(text: str) -> dict:
@@ -55,6 +66,48 @@ def _normalize_priority(value: str) -> str:
     aliases = {"高": "high", "中": "medium", "低": "low"}
     value = aliases.get(str(value).strip(), str(value).strip().lower())
     return value if value in {"high", "medium", "low"} else "medium"
+
+
+def _valid_deadline(value: object, month: str) -> str:
+    """保留近期有效日期；模型给出历史或过远日期时使用系统截止日。"""
+    try:
+        deadline = datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+        today = datetime.now().date()
+        if today <= deadline <= today + timedelta(days=90):
+            return deadline.isoformat()
+    except (TypeError, ValueError):
+        pass
+    return _deadline_for_month(month)
+
+
+def _is_executable_task(item: dict) -> bool:
+    """判断任务是否具备动作和可复核对象，拒绝不可直接执行的口号式任务。"""
+    if not isinstance(item, dict):
+        return False
+    title = re.sub(r"\s+", "", str(item.get("task_title") or ""))
+    if len(title) < 8 or _TASK_VAGUE_RE.search(title):
+        return False
+    return bool(_TASK_ACTION_RE.search(title) and _TASK_OBJECT_RE.search(title))
+
+
+def _filter_executable_tasks(items: list[dict], month: str) -> tuple[list[dict], int]:
+    """清理模型输出，并将截止日规范为可执行的近期日期。"""
+    accepted, seen, rejected = [], set(), 0
+    for item in items:
+        if not _is_executable_task(item):
+            rejected += 1
+            continue
+        normalized = dict(item)
+        normalized["task_title"] = re.sub(r"\s+", " ", str(item["task_title"])).strip().rstrip("。；")
+        key = re.sub(r"\s+", "", normalized["task_title"])
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized["deadline"] = _valid_deadline(item.get("deadline"), month)
+        accepted.append(normalized)
+        if len(accepted) == 3:
+            break
+    return accepted, rejected
 
 
 async def _request(method: str, path: str, **kwargs) -> dict:
@@ -147,7 +200,9 @@ def _fallback_tasks(product: str, month: str, scenario: str, conclusion: str, ev
                 "deadline": _deadline_for_month(month),
                 "suggestion": suggestion,
             })
-        return tasks
+        executable, _ = _filter_executable_tasks(tasks, month)
+        if executable:
+            return executable
     candidates = [
         (
             "材料", ("材料", "采购", "原材料", "供应商", "合同", "价格"),
@@ -177,12 +232,12 @@ def _fallback_tasks(product: str, month: str, scenario: str, conclusion: str, ev
                 "suggestion": suggestion,
             })
     return tasks[:3] or [{
-        "task_title": f"请核查{product}{month_label}成本异常归因结论",
+        "task_title": f"请复核{product}{month_label}成本明细、会计凭证及费用分摊表",
         "assignee": _determine_assignee("通用"),
         "source": {"analysis_scenario": scenario, "attribution_conclusion": conclusion},
         "priority": priority,
         "deadline": _deadline_for_month(month),
-        "suggestion": "请依据归因结论复核相关成本数据并制定整改措施。",
+        "suggestion": "核对成本明细、会计凭证和费用分摊表，形成可验证的差异核查记录。",
     }]
 
 
@@ -205,14 +260,17 @@ def _benchmark_suggestion_tasks(product: str, month: str, scenario: str, conclus
         title = re.sub(r"\s+", " ", suggestion).strip().rstrip("。；")
         if not re.match(r"^(请|核查|复核|建立|制定|落实|启动|开展|优化|共享|确认|加强)", title):
             title = f"请落实：{title}"
-        tasks.append({
+        candidate = {
             "task_title": title[:100],
             "assignee": _determine_assignee(assignee_key),
             "source": {"analysis_scenario": scenario, "attribution_conclusion": conclusion},
             "priority": _normalize_priority(item.get("priority", "medium")),
             "deadline": item.get("deadline") or _deadline_for_month(month),
             "suggestion": suggestion,
-        })
+        }
+        if _is_executable_task(candidate):
+            candidate["deadline"] = _valid_deadline(candidate["deadline"], month)
+            tasks.append(candidate)
         if len(tasks) == 3:
             break
     return tasks
@@ -241,7 +299,7 @@ def _make_task_draft(
             "attribution_conclusion": source.get("attribution_conclusion") or conclusion,
         },
         "priority": _normalize_priority(item.get("priority", "medium")),
-        "deadline": item.get("deadline") or _deadline_for_month(month),
+        "deadline": _valid_deadline(item.get("deadline"), month),
         "suggestion": item.get("suggestion", ""),
         "analysis_evidence": dict(evidence or {}),
         "rag_used": bool(evidence.get("rag_sources") or evidence.get("rag_used")) if isinstance(evidence, dict) else False,
@@ -267,27 +325,36 @@ async def generate_task_drafts(
     evidence = dict(analysis_evidence or {})
     # 两类分析场景都优先调用 AI；结构化建议仅作为模型不可用时的备用来源。
     generated = []
+    rejected_tasks = 0
     generation_source = "ai"
     if not generated:
         try:
             generated = await _generate_llm_tasks(product, month, scenario, conclusion, evidence)
+            generated, rejected_tasks = _filter_executable_tasks(generated, month)
         except Exception:
             logger.warning("LLM整改任务JSON生成失败，使用规则化兜底任务", exc_info=True)
             generated = []
     if not generated:
         if analysis_scenario == "benchmark_attribution":
             generated = _benchmark_suggestion_tasks(product, month, scenario, conclusion, evidence)
+            generated, rejected = _filter_executable_tasks(generated, month)
+            rejected_tasks += rejected
             if generated:
                 generation_source = "analysis_suggestions"
         if not generated:
             generation_source = "fallback"
             generated = _fallback_tasks(product, month, scenario, conclusion, evidence)
+            generated, rejected = _filter_executable_tasks(generated, month)
+            rejected_tasks += rejected
 
     # 这里只生成临时草稿供分析页审阅，不写入持久化任务表。
+    # 模型不得决定实际责任人；草稿统一落到系统已配置的部门和岗位。
+    for item in generated:
+        item["assignee"] = _determine_assignee(str(item.get("task_title") or ""))
     drafts = [_make_task_draft(product, month, item, scenario, conclusion, evidence) for item in generated[:3]]
     return {
         "product": product, "month": month, "tasks_generated": len(drafts),
-        "generation_source": generation_source, "tasks": drafts,
+        "generation_source": generation_source, "rejected_tasks": rejected_tasks, "tasks": drafts,
     }
 
 

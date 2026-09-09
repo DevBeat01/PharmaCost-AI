@@ -9,13 +9,14 @@ echo.
 
 cd /d "%~dp0"
 
-REM --- 设置 Anaconda Python 路径 ---
-set PYTHON=E:\Anacounda\python.exe
+REM --- 设置 Python 路径；可由一键启动器通过环境变量覆盖 ---
+if not defined PHARMACOST_PYTHON set "PHARMACOST_PYTHON=E:\Anacounda\python.exe"
+set "PYTHON=%PHARMACOST_PYTHON%"
 
-REM --- 检查 Anaconda 环境 ---
+REM --- 检查 Python 环境 ---
 if not exist "%PYTHON%" (
-    echo [错误] 未找到 Anaconda Python: %PYTHON%
-    echo 请确认 E:\Anacounda 目录存在
+    echo [错误] 未找到 Python: %PYTHON%
+    echo 请确认 Python 路径存在，或设置 PHARMACOST_PYTHON。
     pause
     exit /b 1
 )

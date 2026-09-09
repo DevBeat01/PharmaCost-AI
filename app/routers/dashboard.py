@@ -1,9 +1,13 @@
 """看板API路由"""
+import json
+import logging
 from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from security import validate_product, validate_month
 
 router = APIRouter()
+logger = logging.getLogger("routers.dashboard")
 
 
 @router.get("/three-dim")
@@ -47,6 +51,25 @@ async def get_attribution(product: str = Query(...), month: str = Query(...), fo
     from analysis.dashboard import dashboard_attribution
     # 模型调用是同步阻塞操作，放入线程池避免阻塞其他看板接口。
     return await run_in_threadpool(dashboard_attribution, product, month, force)
+
+
+@router.get("/attribution/stream")
+async def get_attribution_stream(product: str = Query(...), month: str = Query(...), force: bool = Query(False)):
+    """以 SSE 流式返回看板归因文本。"""
+    product = validate_product(product)
+    month = validate_month(month)
+    logger.info("归因分析SSE请求: product=%s month=%s force=%s", product, month, force)
+    from analysis.dashboard import dashboard_attribution_stream
+
+    def events():
+        for item in dashboard_attribution_stream(product, month, force):
+            yield f"event: {item.get('event', 'message')}\ndata: {json.dumps(item.get('data', {}), ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    })
 
 
 @router.get("/waterfall")

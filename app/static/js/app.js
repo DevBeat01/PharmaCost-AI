@@ -10,10 +10,12 @@
         // 初始化即提供可用的演示参数，避免产品接口慢/失败时其他模块出现空表单。
         currentProduct: '银黄口服液',
         currentMonth: '2026-06',
+        selectorsReady: false,
         products: ['银黄口服液', '板蓝根颗粒', '六味地黄胶囊'],
         months: ['2026-01', '2026-02', '2026-03', '2026-04', '2026-05', '2026-06'],
         productSpecs: {},
         echartsInstances: {},   // 页面内 ECharts 实例缓存
+        chartResizeObservers: {}, // 图表容器尺寸监听器
     };
 
     /* ============ 工具函数 ============ */
@@ -69,6 +71,66 @@
                 // 外部取消代表用户切换了产品/月，不应显示旧请求的错误或兜底结果。
                 if (e.name === 'AbortError' && externalSignal?.aborted) throw e;
                 if (e.name === 'AbortError') throw new Error(`API请求超时（${timeoutMs}ms）`);
+                throw e;
+            } finally {
+                clearTimeout(timer);
+                if (externalSignal) externalSignal.removeEventListener('abort', abortExternal);
+            }
+        },
+
+        /**
+         * 读取 SSE 流；onEvent(eventName, parsedData) 会在每个事件到达时调用。
+         */
+        async streamSse(url, options = {}) {
+            const { timeoutMs = 90000, signal: externalSignal, onEvent, ...fetchOptions } = options;
+            const controller = new AbortController();
+            const abortExternal = () => controller.abort();
+            if (externalSignal) {
+                if (externalSignal.aborted) controller.abort();
+                else externalSignal.addEventListener('abort', abortExternal, { once: true });
+            }
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const resp = await fetch(url, {
+                    ...fetchOptions,
+                    signal: controller.signal,
+                    headers: { Accept: 'text/event-stream', ...(fetchOptions.headers || {}) },
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                if (!resp.body) throw new Error('浏览器不支持流式响应');
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                const dispatch = async raw => {
+                    const lines = raw.split(/\r?\n/);
+                    let eventName = 'message';
+                    const dataLines = [];
+                    lines.forEach(line => {
+                        if (line.startsWith('event:')) eventName = line.slice(6).trim();
+                        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+                    });
+                    if (!dataLines.length || typeof onEvent !== 'function') return;
+                    const payloadText = dataLines.join('\n');
+                    let payload;
+                    try { payload = JSON.parse(payloadText); } catch (_) { payload = { text: payloadText }; }
+                    await onEvent(eventName, payload);
+                    // 让浏览器在连续分片之间完成一次绘制，确保流式文本可见。
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                };
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const groups = buffer.split(/\r?\n\r?\n/);
+                    buffer = groups.pop() || '';
+                    for (const group of groups) await dispatch(group);
+                }
+                buffer += decoder.decode();
+                if (buffer.trim()) await dispatch(buffer);
+            } catch (e) {
+                console.error('[SSE Error]', url, e);
+                if (e.name === 'AbortError' && externalSignal?.aborted) throw e;
+                if (e.name === 'AbortError') throw new Error(`流式请求超时（${timeoutMs}ms）`);
                 throw e;
             } finally {
                 clearTimeout(timer);
@@ -151,10 +213,36 @@
          * 安全销毁 ECharts 实例
          */
         disposeChart(key) {
+            if (AppState.chartResizeObservers[key]) {
+                AppState.chartResizeObservers[key].disconnect();
+                delete AppState.chartResizeObservers[key];
+            }
             if (AppState.echartsInstances[key]) {
                 AppState.echartsInstances[key].dispose();
                 delete AppState.echartsInstances[key];
             }
+        },
+
+        /**
+         * 绑定容器尺寸变化，避免切换布局或侧栏后图表按旧尺寸绘制。
+         */
+        observeChartResize(domId, chart, el) {
+            if (!chart || !el || typeof ResizeObserver === 'undefined') return;
+            if (AppState.chartResizeObservers[domId]) {
+                AppState.chartResizeObservers[domId].disconnect();
+            }
+            let frame = 0;
+            const observer = new ResizeObserver(() => {
+                if (frame) cancelAnimationFrame(frame);
+                frame = requestAnimationFrame(() => {
+                    frame = 0;
+                    if (!chart.isDisposed() && el.clientWidth > 0 && el.clientHeight > 0) {
+                        chart.resize();
+                    }
+                });
+            });
+            observer.observe(el);
+            AppState.chartResizeObservers[domId] = observer;
         },
 
         /**
@@ -164,11 +252,19 @@
             const el = document.getElementById(domId);
             if (!el) return null;
             let inst = echarts.getInstanceByDom(el);
-            if (inst) {
+            if (AppState.chartResizeObservers[domId]) {
+                AppState.chartResizeObservers[domId].disconnect();
+                delete AppState.chartResizeObservers[domId];
+            }
+            if (inst && !inst.isDisposed()) {
                 inst.dispose();
             }
-            inst = echarts.init(el);
+            // SVG 保证坐标轴、标签和线条在高分屏及导出场景下保持矢量清晰度。
+            inst = echarts.init(el, null, { renderer: 'svg' });
             AppState.echartsInstances[domId] = inst;
+            // 初始化后立即按当前容器尺寸重算，避免隐藏页面切回时沿用 0 宽度。
+            if (el.clientWidth > 0 && el.clientHeight > 0) inst.resize();
+            this.observeChartResize(domId, inst, el);
             return inst;
         },
 
@@ -382,6 +478,7 @@
         } finally {
             Utils.hideLoading();
             // 产品数据到达后刷新当前页面，补齐页面级下拉框和真实数据。
+            AppState.selectorsReady = true;
             Router.renderPage(AppState.currentPage);
             setTimeout(refreshIcons, 50);
         }

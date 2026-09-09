@@ -22,6 +22,7 @@ DATA_UPLOAD_DIR = SETTINGS_DIR / "data_uploads"
 KNOWLEDGE_UPLOAD_DIR = SETTINGS_DIR / "knowledge_uploads"
 TEMPLATE_UPLOAD_DIR = SETTINGS_DIR / "template_uploads"
 DATA_SOURCE_CONFIG_PATH = SETTINGS_DIR / "data_sources.json"
+MODEL_CONFIG_PATH = SETTINGS_DIR / "model_config.json"
 
 # CSV文件路径
 CSV_COST_2026 = COST_DATA_DIR / "中药一厂_成本汇总_2026年1-6月.csv"
@@ -71,16 +72,42 @@ def get_report_template_path() -> Path:
     """Use the managed template override only when it is a valid local file."""
     return CUSTOM_TEMPLATE_PATH if CUSTOM_TEMPLATE_PATH.is_file() else TEMPLATE_DOCX
 
-# LLM配置：文本生成优先使用 DeepSeek，MiMo 作为备用。
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-DEEPSEEK_VERIFY_SSL = os.getenv("DEEPSEEK_VERIFY_SSL", "true").strip().lower() not in {"0", "false", "no"}
+# LLM配置：环境变量提供默认值，系统设置中的运行时覆盖文件优先级更高。
+def _read_model_overrides() -> dict:
+    try:
+        import json
+        data = json.loads(MODEL_CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
 
-MIMO_API_KEY = os.getenv("MIMO_API_KEY", "")
-MIMO_BASE_URL = os.getenv("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
-MIMO_MODEL = os.getenv("MIMO_MODEL", "mimo-v2.5")
-MIMO_VERIFY_SSL = os.getenv("MIMO_VERIFY_SSL", "true").strip().lower() not in {"0", "false", "no"}
+
+_MODEL_OVERRIDES = _read_model_overrides()
+
+
+def _model_value(name: str, default):
+    value = _MODEL_OVERRIDES.get(name)
+    return value if value is not None else default
+
+
+def _model_bool(name: str, default: bool) -> bool:
+    value = _model_value(name, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+DEEPSEEK_API_KEY = str(_model_value("DEEPSEEK_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")))
+DEEPSEEK_BASE_URL = str(_model_value("DEEPSEEK_BASE_URL", os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")))
+DEEPSEEK_MODEL = str(_model_value("DEEPSEEK_MODEL", os.getenv("DEEPSEEK_MODEL", "deepseek-chat")))
+DEEPSEEK_VERIFY_SSL = _model_bool("DEEPSEEK_VERIFY_SSL", os.getenv("DEEPSEEK_VERIFY_SSL", "true").strip().lower() not in {"0", "false", "no"})
+DEEPSEEK_PROVIDER_LABEL = str(_model_value("DEEPSEEK_PROVIDER_LABEL", os.getenv("DEEPSEEK_PROVIDER_LABEL", "DeepSeek")))
+
+MIMO_API_KEY = str(_model_value("MIMO_API_KEY", os.getenv("MIMO_API_KEY", "")))
+MIMO_BASE_URL = str(_model_value("MIMO_BASE_URL", os.getenv("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")))
+MIMO_MODEL = str(_model_value("MIMO_MODEL", os.getenv("MIMO_MODEL", "mimo-v2.5")))
+MIMO_VERIFY_SSL = _model_bool("MIMO_VERIFY_SSL", os.getenv("MIMO_VERIFY_SSL", "true").strip().lower() not in {"0", "false", "no"})
+MIMO_PROVIDER_LABEL = str(_model_value("MIMO_PROVIDER_LABEL", os.getenv("MIMO_PROVIDER_LABEL", "MiMo")))
 
 # Embedding配置
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")

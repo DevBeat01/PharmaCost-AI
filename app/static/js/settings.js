@@ -18,6 +18,9 @@
             });
             document.getElementById('settingsReloadData')?.addEventListener('click', () => this.action('/api/settings/reload-data', '成本数据已重新加载'));
             document.getElementById('settingsRebuildKnowledge')?.addEventListener('click', () => this.action('/api/settings/rebuild-knowledge', '知识库重建任务已启动'));
+            document.getElementById('settingsSaveModels')?.addEventListener('click', () => this.saveModels());
+            document.getElementById('settingsResetModels')?.addEventListener('click', () => this.resetModels());
+            this.bindModelPresets();
             document.getElementById('settingsKnowledgeUpload')?.addEventListener('change', event => this.upload('/api/settings/knowledge', event.target));
             document.getElementById('settingsTemplateUpload')?.addEventListener('change', event => this.upload('/api/settings/template', event.target));
             this.dialog?.addEventListener('change', event => {
@@ -63,9 +66,52 @@
                 ].map(([icon, text]) => `<span class="settings-status-item"><i data-lucide="${icon}"></i>${Utils.escapeHtml(text)}</span>`).join('');
             }
             this.renderDataFiles(data.data_files || []);
+            this.renderModels(data.models || {});
             this.renderKnowledgeFiles(data.knowledge_files || []);
             this.renderTemplate(data.template || null);
             refreshIcons();
+        },
+
+        modelPresets: {
+            deepseek: { label: 'DeepSeek', url: 'https://api.deepseek.com', model: 'deepseek-chat' },
+            mimo: { label: 'MiMo', url: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.5' },
+            qwen: { label: '通义千问', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+            zhipu: { label: '智谱 GLM', url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
+            kimi: { label: 'Kimi', url: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+        },
+
+        bindModelPresets() {
+            ['Deepseek', 'Mimo'].forEach(slot => document.getElementById(`settings${slot}Preset`)?.addEventListener('change', event => {
+                const preset = this.modelPresets[event.target.value]; if (!preset) return;
+                document.getElementById(`settings${slot}Label`).value = preset.label;
+                document.getElementById(`settings${slot}Url`).value = preset.url;
+                document.getElementById(`settings${slot}Model`).value = preset.model;
+            }));
+        },
+
+        renderModels(models) {
+            const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value ?? ''; };
+            const deepseek = models.deepseek || {}, mimo = models.mimo || {};
+            set('settingsDeepseekLabel', deepseek.provider_label || 'DeepSeek'); set('settingsDeepseekUrl', deepseek.base_url); set('settingsDeepseekModel', deepseek.model);
+            set('settingsMimoLabel', mimo.provider_label || 'MiMo'); set('settingsMimoUrl', mimo.base_url); set('settingsMimoModel', mimo.model);
+            const ssl1 = document.getElementById('settingsDeepseekSsl'); if (ssl1) ssl1.checked = deepseek.verify_ssl !== false;
+            const ssl2 = document.getElementById('settingsMimoSsl'); if (ssl2) ssl2.checked = mimo.verify_ssl !== false;
+            const state1 = document.getElementById('settingsDeepseekKeyState'); if (state1) state1.textContent = deepseek.configured ? `当前：${deepseek.api_key}` : '当前未配置';
+            const state2 = document.getElementById('settingsMimoKeyState'); if (state2) state2.textContent = mimo.configured ? `当前：${mimo.api_key}` : '当前未配置';
+            set('settingsDeepseekKey', ''); set('settingsMimoKey', '');
+        },
+
+        async saveModels() {
+            const get = id => document.getElementById(id);
+            const payload = {
+                deepseek_provider_label: get('settingsDeepseekLabel')?.value, deepseek_api_key: get('settingsDeepseekKey')?.value || '', deepseek_base_url: get('settingsDeepseekUrl')?.value, deepseek_model: get('settingsDeepseekModel')?.value, deepseek_verify_ssl: Boolean(get('settingsDeepseekSsl')?.checked),
+                mimo_provider_label: get('settingsMimoLabel')?.value, mimo_api_key: get('settingsMimoKey')?.value || '', mimo_base_url: get('settingsMimoUrl')?.value, mimo_model: get('settingsMimoModel')?.value, mimo_verify_ssl: Boolean(get('settingsMimoSsl')?.checked) };
+            await this.action('/api/settings/models', '模型配置已保存并生效', 'PUT', { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        },
+
+        async resetModels() {
+            if (!window.confirm('恢复后将删除系统设置中的模型覆盖配置，改用 app/.env。是否继续？')) return;
+            await this.action('/api/settings/models', '模型配置已恢复为环境变量设置', { method: 'DELETE' });
         },
 
         renderDataFiles(files) {
@@ -146,10 +192,14 @@
             }
         },
 
-        async action(endpoint, fallbackMessage, method = 'POST') {
+        async action(endpoint, fallbackMessage, method = 'POST', requestOptions = {}) {
+            if (method && typeof method === 'object') {
+                requestOptions = method;
+                method = requestOptions.method || 'POST';
+            }
             this.message('正在处理...');
             try {
-                const response = await fetch(endpoint, { method });
+                const response = await fetch(endpoint, { ...requestOptions, method });
                 const data = await response.json().catch(() => ({}));
                 if (!response.ok) throw new Error(data.detail || data.message || `HTTP ${response.status}`);
                 this.render(data.summary || await Utils.api('/api/settings/summary'));

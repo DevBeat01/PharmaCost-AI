@@ -4,6 +4,7 @@
 const BenchmarkPage = {
     _rendered: false,
     _taskGenerationContext: null,
+    _attributionController: null,
 
     render() {
         const container = document.getElementById('page-benchmark');
@@ -134,6 +135,8 @@ const BenchmarkPage = {
         const product = document.getElementById('benchProduct').value;
         const month = document.getElementById('benchMonth').value;
         const params = { product, month };
+        if (this._attributionController) this._attributionController.abort();
+        this._attributionController = new AbortController();
         this.setTaskGenerationContext(null);
 
         document.getElementById('step1Desc').textContent = '正在加载差异数据...';
@@ -334,12 +337,26 @@ const BenchmarkPage = {
         target.innerHTML = Utils.inlineLoading('AI正在分析中，请稍候...');
 
         try {
-            const data = await Utils.api(`/api/benchmark/attribution?${Utils.qs({ ...params, force: force ? 'true' : undefined })}`, {
+            let accumulated = '';
+            let finalData = null;
+            await Utils.streamSse(`/api/benchmark/attribution/stream?${Utils.qs({ ...params, force: force ? 'true' : undefined })}`, {
+                signal: this._attributionController && this._attributionController.signal,
                 timeoutMs: 90000,
+                onEvent: (eventName, payload) => {
+                    if (eventName === 'chunk') {
+                        accumulated += String(payload.text || '');
+                        target.innerHTML = this.plainAttributionToHtml(this.formatAttributionPlainText(accumulated));
+                        const details = document.getElementById('benchmarkAttributionDetails');
+                        if (details) { details.style.display = ''; details.open = true; }
+                    } else if (eventName === 'complete') {
+                        finalData = payload;
+                    }
+                },
             });
+            const data = finalData || {};
             if (data.error) throw new Error(data.error);
             this.renderAttribution({
-                attribution: data.attribution,
+                attribution: data.attribution || accumulated,
                 diff_data: data.diff_data,
                 suggestions: data.suggestions,
                 ragSources: data.rag_sources,
@@ -351,6 +368,7 @@ const BenchmarkPage = {
                 evidence: this.buildTaskEvidence(data),
             });
         } catch (e) {
+            if (e.name === 'AbortError') return;
             this.renderError('attributionContent', `AI归因不可用：${e.message || '请稍后重试'}`);
             this.renderError('benchmarkAttributionSummary', 'AI归因暂时不可用，请稍后重试。');
             document.getElementById('step3Desc').textContent = 'AI归因不可用';
@@ -363,7 +381,7 @@ const BenchmarkPage = {
         }, 1500);
     },
 
-    sanitizeAttributionMarkdown(value) {
+    formatAttributionPlainText(value) {
         const lines = String(value || '').replace(/\r/g, '').replace(/```[\s\S]*?```/g, '').replace(/```/g, '').split('\n');
         const isTableRow = line => line.includes('|') && line.split('|').filter(cell => cell.trim()).length >= 2;
         const isTableDivider = line => /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
@@ -372,23 +390,56 @@ const BenchmarkPage = {
             .replace(/__(.*?)__/g, '$1')
             .replace(/`([^`]+)`/g, '$1')
             .replace(/\*+/g, '')
-            .replace(/_+/g, '');
+            .replace(/_+/g, '')
+            .replace(/^\s*>+\s*/, '')
+            .trim();
         const output = [];
+        const sectionMap = { '结论摘要': 1, '总体结论': 1, '结论': 1, '重点分析': 2, '常规分析': 2, '差异分析': 2, '改进建议': 3, '建议': 3 };
+        let section = 0;
+        let itemIndex = 0;
         for (const line of lines) {
             if (isTableDivider(line)) continue;
             if (isTableRow(line)) {
                 const cells = line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(cell => plain(cell).trim()).filter(Boolean);
-                if (cells.length >= 2) output.push(`- ${cells[0]}：${cells.slice(1).join('；')}`);
+                if (cells.length >= 2) {
+                    const value = `${cells[0]}：${cells.slice(1).join('；')}`;
+                    output.push(section >= 2 ? `${section}.${++itemIndex} ${value}` : value);
+                }
                 continue;
             }
-            output.push(plain(line));
+            const value = plain(line);
+            if (!value) continue;
+            const heading = value.replace(/^#{1,6}\s*/, '').replace(/^(?:[一二三]|[123])[、.)]\s*/, '').trim();
+            const canonical = Object.keys(sectionMap).find(key => heading === key || heading.startsWith(`${key}：`) || heading.startsWith(`${key}:`));
+            if (canonical) {
+                section = sectionMap[canonical];
+                itemIndex = 0;
+                output.push(`${section}. ${canonical}`);
+                continue;
+            }
+            const body = value.replace(/^(?:[-*•]|\d+(?:[.、]\d+)?[.)、]?)\s*/, '').trim();
+            if (section >= 2 && /^(?:[-*•]|\d+(?:[.、]\d+)?[.)、]?)\s*/.test(value)) {
+                output.push(`${section}.${++itemIndex} ${body}`);
+            } else {
+                output.push(body);
+            }
         }
         return output.join('\n').replace(/\n{3,}/g, '\n\n').trim();
     },
 
+    plainAttributionToHtml(value) {
+        const lines = String(value || '').split('\n').map(line => line.trim()).filter(Boolean);
+        return lines.map(line => {
+            if (/^[123]\.\s+(结论摘要|重点分析|改进建议)$/.test(line)) {
+                return `<h2>${Utils.escapeHtml(line)}</h2>`;
+            }
+            return `<p>${Utils.escapeHtml(line)}</p>`;
+        }).join('') || '<p>暂无分析结果</p>';
+    },
+
     analysisWithoutSuggestions(value) {
-        const text = this.sanitizeAttributionMarkdown(value);
-        const suggestionHeading = /^\s*#{1,2}\s*改进建议\s*$/m;
+        const text = this.formatAttributionPlainText(value);
+        const suggestionHeading = /^\s*3\.\s*改进建议\s*$/m;
         const match = suggestionHeading.exec(text);
         return (match ? text.slice(0, match.index) : text).trim();
     },
@@ -418,15 +469,13 @@ const BenchmarkPage = {
         summary.innerHTML = `<strong>${unitText}</strong><span>${driverText}</span>`;
         badge.style.display = keyRows.length ? '' : 'none';
 
-        const markdownToHtml = (typeof DashboardPage !== 'undefined' && DashboardPage.markdownToHtml)
-            ? DashboardPage.markdownToHtml.bind(DashboardPage)
-            : value => `<p>${Utils.escapeHtml(String(value || ''))}</p>`;
-        let html = markdownToHtml(attribution);
+        let html = this.plainAttributionToHtml(attribution);
         if (suggestions.length) {
-            html += '<h2>改进建议</h2><ol class="benchmark-suggestion-list">';
+            html += '<h2>3. 改进建议</h2><ol class="benchmark-suggestion-list">';
             suggestions.forEach(item => {
-                const suggestionHtml = markdownToHtml(this.sanitizeAttributionMarkdown(item.suggestion || ''));
-                html += `<li><div class="benchmark-suggestion-content">${suggestionHtml}</div><span class="benchmark-suggestion-meta">责任部门：${Utils.escapeHtml(item.department || '--')} · 优先级：${Utils.escapeHtml(item.priority || '--')} · 截止：${Utils.escapeHtml(item.deadline || '--')}</span></li>`;
+                const suggestionHtml = this.plainAttributionToHtml(this.formatAttributionPlainText(item.suggestion || ''));
+                const priorityLabel = { high: '高', medium: '中', low: '低', '高': '高', '中': '中', '低': '低' }[String(item.priority || '').toLowerCase()] || '中';
+                html += `<li><div class="benchmark-suggestion-content">${suggestionHtml}</div><span class="benchmark-suggestion-meta">责任部门：${Utils.escapeHtml(item.department || '--')} · 优先级：${priorityLabel} · 截止：${Utils.escapeHtml(item.deadline || '--')}</span></li>`;
             });
             html += '</ol>';
         }
@@ -435,10 +484,9 @@ const BenchmarkPage = {
         }
         target.innerHTML = html;
         details.style.display = '';
-        const normalized = String(attribution || '').trim();
-        const sentences = normalized.split(/(?<=[。！？；])\s*|\n+/).filter(Boolean);
-        details.open = sentences.length <= 2 && normalized.length <= 240;
-        details.querySelector('summary').textContent = details.open ? '收起归因分析' : '展开完整归因分析';
+        // 生成完成后保持正文展开，用户仍可手动收起。
+        details.open = true;
+        details.querySelector('summary').textContent = '收起归因分析';
     },
 
     buildTaskEvidence(data) {
@@ -477,7 +525,7 @@ const BenchmarkPage = {
         const button = document.getElementById('btnBenchmarkGenerateTasks');
         if (!button) return;
         button.disabled = true;
-        button.innerHTML = '<i data-lucide="loader-circle"></i><span>生成中...</span>';
+        button.innerHTML = '<i data-lucide="loader-2"></i><span>生成中...</span>';
         try {
             const data = await Utils.api('/api/rpa/generate', {
                 method: 'POST',
@@ -515,7 +563,7 @@ const BenchmarkPage = {
         const notice = document.createElement('div');
         notice.id = 'benchmarkTaskGenerationToast';
         notice.className = `operation-toast${success ? '' : ' error'}`;
-        notice.innerHTML = `<i data-lucide="${success ? 'circle-check' : 'circle-alert'}"></i><span>${Utils.escapeHtml(message)}${success ? ' <a href="#rpa">查看任务</a>' : ''}</span>`;
+        notice.innerHTML = `<i data-lucide="${success ? 'check-circle' : 'alert-circle'}"></i><span>${Utils.escapeHtml(message)}${success ? ' <a href="#rpa">查看任务</a>' : ''}</span>`;
         document.body.appendChild(notice);
         if (typeof refreshIcons === 'function') refreshIcons();
         setTimeout(() => notice.remove(), 6000);

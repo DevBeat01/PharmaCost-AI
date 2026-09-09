@@ -8,7 +8,7 @@
   <title>成本智能分析系统 | ERP</title>
   <link rel="icon"
     href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='3' fill='%23d4610a'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3.5' stroke-linecap='square'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/css/style.css?v=20260901-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=20260907-6">
   <script src="/static/vendor/echarts.min.js"></script>
   <script src="/static/vendor/lucide.min.js"></script>
 </head>
@@ -122,6 +122,33 @@
       </header>
       <div class="settings-dialog-body">
         <div class="settings-status" id="settingsSystemStatus"></div>
+        <section class="settings-section" aria-labelledby="settingsModelTitle">
+          <div class="settings-section-title">
+            <div><h3 id="settingsModelTitle">模型配置</h3><p>支持 DeepSeek、通义千问、智谱、Kimi 等 OpenAI 兼容接口，也可完全自定义。</p></div>
+            <button class="settings-action-button" id="settingsResetModels" type="button" title="恢复为环境变量设置"><i data-lucide="rotate-ccw"></i>恢复默认</button>
+          </div>
+          <div class="model-config-form">
+            <div class="model-provider-grid">
+              <fieldset class="model-provider-card primary"><legend id="settingsDeepseekTitle"><span class="model-role-badge">主模型</span>模型 1</legend>
+                <label>厂商模板<select id="settingsDeepseekPreset"><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="zhipu">智谱 GLM</option><option value="kimi">Kimi</option><option value="custom">自定义</option></select></label>
+                <label>厂商名称<input id="settingsDeepseekLabel" type="text" placeholder="例如：DeepSeek"></label>
+                <label>API 密钥<input id="settingsDeepseekKey" type="password" autocomplete="new-password" placeholder="留空保持当前密钥"><small id="settingsDeepseekKeyState"></small></label>
+                <label>接口地址<input id="settingsDeepseekUrl" type="url" placeholder="https://api.deepseek.com"></label>
+                <label>模型名称<input id="settingsDeepseekModel" type="text" placeholder="deepseek-chat"></label>
+                <label class="model-checkbox"><input id="settingsDeepseekSsl" type="checkbox">校验证书（SSL）</label>
+              </fieldset>
+              <fieldset class="model-provider-card fallback"><legend id="settingsMimoTitle"><span class="model-role-badge">备用模型</span>模型 2</legend>
+                <label>厂商模板<select id="settingsMimoPreset"><option value="mimo">MiMo</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="zhipu">智谱 GLM</option><option value="kimi">Kimi</option><option value="custom">自定义</option></select></label>
+                <label>厂商名称<input id="settingsMimoLabel" type="text" placeholder="例如：MiMo"></label>
+                <label>API 密钥<input id="settingsMimoKey" type="password" autocomplete="new-password" placeholder="留空保持当前密钥"><small id="settingsMimoKeyState"></small></label>
+                <label>接口地址<input id="settingsMimoUrl" type="url" placeholder="https://api.xiaomimimo.com/v1"></label>
+                <label>模型名称<input id="settingsMimoModel" type="text" placeholder="mimo-v2.5"></label>
+                <label class="model-checkbox"><input id="settingsMimoSsl" type="checkbox">校验证书（SSL）</label>
+              </fieldset>
+            </div>
+            <button class="btn btn-primary settings-model-save" id="settingsSaveModels" type="button"><i data-lucide="save"></i>保存模型配置</button>
+          </div>
+        </section>
         <section class="settings-section" aria-labelledby="settingsDataTitle">
           <div class="settings-section-title">
             <div><h3 id="settingsDataTitle">成本数据文件</h3><p>导入 CSV 后立即校验并重载；删除导入文件将恢复竞赛默认数据。</p></div>
@@ -156,11 +183,11 @@
   </div>
 
   <!-- Scripts -->
-  <script src="/static/js/app.js"></script>
-  <script src="/static/js/settings.js?v=20260901-1"></script>
-  <script src="/static/js/dashboard.js?v=20260831-2"></script>
-  <script src="/static/js/report.js?v=20260829-1"></script>
-  <script src="/static/js/benchmark.js?v=20260831-3"></script>
+  <script src="/static/js/app.js?v=20260908-1"></script>
+  <script src="/static/js/settings.js?v=20260902-2"></script>
+  <script src="/static/js/dashboard.js?v=20260907-5"></script>
+  <script src="/static/js/report.js?v=20260904-1"></script>
+  <script src="/static/js/benchmark.js?v=20260902-6"></script>
   <script src="/static/js/rpa.js?v=20260908-1"></script>
   <script>lucide.createIcons();</script>
 </body>

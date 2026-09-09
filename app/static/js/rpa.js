@@ -38,7 +38,7 @@ const RpaPage = {
                     <div class="field"><label>优先级</label><select id="filterPriority"><option value="">全部</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></div>
                     <div class="field"><label>产品</label><select id="filterProduct"><option value="">全部</option>${AppState.products.map(p => `<option value="${Utils.productName(p)}">${Utils.productLabel(p)}</option>`).join('')}</select></div>
                     <div class="field"><label>月份</label><select id="filterMonth"><option value="">全部</option>${AppState.months.map(m => `<option value="${m}">${m}</option>`).join('')}</select></div>
-                    <button class="btn btn-primary btn-sm" id="btnFilter">筛选</button>
+                    <button class="btn btn-primary btn-sm" id="btnFilter"><i data-lucide="list-filter" aria-hidden="true"></i><span>筛选</span></button>
                 </div>
                 <div id="taskTable">${Utils.inlineLoading('加载任务列表...')}</div>
             </div>
@@ -168,8 +168,8 @@ const RpaPage = {
             </tr>`;
             });
             const pageOptions = [5, 10, 20, 50].map(size => `<option value="${size}" ${size === pageSize ? 'selected' : ''}>${size} 条</option>`).join('');
-            const pages = Array.from({ length: totalPages }, (_, index) => index + 1).map(number => `<button type="button" class="btn btn-outline btn-sm rpa-page-btn${number === page ? ' active' : ''}" data-table-id="${tableId}" data-page="${number}">${number}</button>`).join('');
-            return `<div class="rpa-table-scroll">${html}</tbody></table></div><div class="rpa-pagination"><label>每页<select class="rpa-page-size" data-table-id="${tableId}">${pageOptions}</select></label><span>第 ${page} / ${totalPages} 页，共 ${rows.length} 条</span><div class="rpa-page-buttons"><button type="button" class="btn btn-outline btn-sm rpa-page-btn" data-table-id="${tableId}" data-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>上一页</button>${pages}<button type="button" class="btn btn-outline btn-sm rpa-page-btn" data-table-id="${tableId}" data-page="${page + 1}" ${page >= totalPages ? 'disabled' : ''}>下一页</button></div></div>`;
+            const pages = Array.from({ length: totalPages }, (_, index) => index + 1).map(number => `<button type="button" class="btn btn-outline btn-sm rpa-page-btn${number === page ? ' active' : ''}" data-table-id="${tableId}" data-page="${number}" aria-label="第 ${number} 页" ${number === page ? 'aria-current="page"' : ''}>${number}</button>`).join('');
+            return `<div class="rpa-table-scroll">${html}</tbody></table></div><div class="rpa-pagination"><label>每页<select class="rpa-page-size" data-table-id="${tableId}">${pageOptions}</select></label><span>第 ${page} / ${totalPages} 页，共 ${rows.length} 条</span><div class="rpa-page-buttons"><button type="button" class="btn btn-outline btn-sm rpa-page-btn" data-table-id="${tableId}" data-page="${page - 1}" ${page <= 1 ? 'disabled' : ''} aria-label="上一页" title="上一页"><i data-lucide="chevron-left" aria-hidden="true"></i></button>${pages}<button type="button" class="btn btn-outline btn-sm rpa-page-btn" data-table-id="${tableId}" data-page="${page + 1}" ${page >= totalPages ? 'disabled' : ''} aria-label="下一页" title="下一页"><i data-lucide="chevron-right" aria-hidden="true"></i></button></div></div>`;
         };
         target.innerHTML = `
             <section class="rpa-task-section"><div class="rpa-task-section-header"><div><h4>待发送至 RPA <span>${pendingRpa.length}</span></h4><p>勾选后提交到 RPA 服务，不发送微信</p></div><button class="btn btn-outline btn-sm" id="btnDispatchSelected" disabled title="勾选待派发草稿后可用"><i data-lucide="send" style="width:16px;height:16px"></i> 发送至 RPA</button></div><div id="rpaDraftTable">${renderTable(pendingRpa, 'rpaDraftTable', '待发送至 RPA 任务')}</div></section>

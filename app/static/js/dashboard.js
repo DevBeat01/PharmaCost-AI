@@ -1,7 +1,7 @@
 /**
  * dashboard.js — 成本看板页面（白卡 SaaS 风格）
  * 适配后端真实数据结构：three-dim / trend / structure / waterfall /
- * material-detail / overhead-detail / labor-metrics / industry-bench
+ * material-detail / overhead-detail / labor-metrics / industry-bench / forecast
  */
 const DashboardPage = {
     _rendered: false,
@@ -15,9 +15,12 @@ const DashboardPage = {
     // v2 用于淘汰旧版本因超时产生的预设兜底文本缓存。
     _attributionStoragePrefix: 'pharmacost.dashboard.attribution.v2:',
     _heatmapResizeObserver: null,
+    _forecastRequestId: 0,
 
     render() {
         const container = document.getElementById('page-dashboard');
+        // 首次加载时等待产品和月份就绪，避免默认参数和实际参数各发起一次归因请求。
+        if (!AppState.selectorsReady) return;
         if (!this._rendered) {
             container.innerHTML = this.template();
             this.bindEvents();
@@ -74,7 +77,7 @@ const DashboardPage = {
 
             <div class="card" id="dashboardAlerts" style="margin-bottom:24px;display:none">
                 <div class="card-header attribution-header">
-                    <h3 class="card-title"><i data-lucide="triangle-alert" style="width:16px;height:16px"></i> 波动告警与归因分析</h3>
+                    <h3 class="card-title"><i data-lucide="alert-triangle" style="width:16px;height:16px"></i> 波动告警与归因分析</h3>
                     <div class="attribution-header-actions">
                         <button id="reanalyzeAttribution" type="button" class="btn btn-outline btn-sm" title="跳过缓存并重新生成归因分析"><i data-lucide="refresh-cw"></i><span>重新分析</span></button>
                         <button id="btnDashboardGenerateTasks" type="button" class="btn btn-outline btn-sm" disabled title="根据当前归因分析生成整改任务"><i data-lucide="list-plus"></i><span>生成整改任务</span></button>
@@ -97,6 +100,24 @@ const DashboardPage = {
                     </div>
                     <div id="chartTrend" style="height:320px;width:100%"></div>
                 </div>
+            </section>
+
+            <!-- 成本预测（加分项） -->
+            <section class="forecast-panel card" style="margin-bottom:24px">
+                <div class="card-header forecast-header">
+                    <div>
+                        <h3 class="card-title"><i data-lucide="line-chart" style="width:16px;height:16px"></i> 下月成本预测</h3>
+                        <p class="forecast-caption" id="forecastCaption">基于历史成本数据估算，预测区间仅供预算参考</p>
+                    </div>
+                    <label class="forecast-method">
+                        <span>预测方法</span>
+                        <select id="forecastMethod" class="selector" aria-label="成本预测方法">
+                            <option value="moving_average">移动平均</option>
+                            <option value="linear">线性回归</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="forecast-layout" id="forecastContent">${Utils.inlineLoading('正在计算下月预测...')}</div>
             </section>
 
             <!-- 多产品交叉分析热力图 -->
@@ -172,6 +193,7 @@ const DashboardPage = {
         const month = document.getElementById('dashMonth');
         const reanalyze = document.getElementById('reanalyzeAttribution');
         const generateTasks = document.getElementById('btnDashboardGenerateTasks');
+        const forecastMethod = document.getElementById('forecastMethod');
         if (product) product.addEventListener('change', () => {
             AppState.currentProduct = product.value;
             this.loadAll();
@@ -182,6 +204,9 @@ const DashboardPage = {
         });
         if (reanalyze) reanalyze.addEventListener('click', () => this.reanalyzeAttribution());
         if (generateTasks) generateTasks.addEventListener('click', () => this.generateTasks());
+        if (forecastMethod) forecastMethod.addEventListener('change', () => {
+            this.loadForecast(AppState.currentProduct, this._loadVersion, forecastMethod.value);
+        });
     },
 
     syncSelectors() {
@@ -226,6 +251,7 @@ const DashboardPage = {
         void this.loadAttribution(product, month, [], version, attributionRequestId);
         this.loadThreeDim(product, month, version);   // 三维表 + 指标卡片
         this.loadTrend(product, version);
+        this.loadForecast(product, version);
         this.loadHeatmap(version);
         this.loadStructure(product, month, version);
         this.loadWaterfall(product, month, version);
@@ -295,21 +321,33 @@ const DashboardPage = {
     async loadAttribution(product, month, alerts, version, requestId = this._attributionRequestId, force = false) {
         const cacheKey = `${product}::${month}`;
         const cached = this._getAttributionCache(cacheKey);
-        if (!force && cached && this.isAttributionCurrent(version, requestId)) {
-            this._attributionRenderedVersion = version;
-            this.renderAlerts(cached.alerts || alerts);
-            this.renderAttribution(cached.analysis, Boolean(cached.important || (cached.alerts || alerts).length), cached.ragSources || cached.rag_sources || []);
-            return;
-        }
+        console.info('[Dashboard] 归因分析请求', { product, month, force });
         try {
-            const data = await Utils.api(`/api/dashboard/attribution?${Utils.qs({ product, month, force: force ? 'true' : undefined })}`, {
+            let accumulated = '';
+            let finalData = null;
+            await Utils.streamSse(`/api/dashboard/attribution/stream?${Utils.qs({ product, month, force: force ? 'true' : undefined })}`, {
                 signal: this._attributionController && this._attributionController.signal,
-                // 模型响应通常需要 15-30 秒，归因请求不应过早回退到预设模板。
-                timeoutMs: 90000
+                timeoutMs: 90000,
+                onEvent: (eventName, payload) => {
+                    if (!this.isAttributionCurrent(version, requestId)) return;
+                    if (eventName === 'meta') {
+                        this._currentAlerts = payload.alerts || alerts;
+                        this.renderAlerts(this._currentAlerts);
+                    } else if (eventName === 'chunk') {
+                        accumulated += String(payload.text || '');
+                        const full = document.getElementById('attributionText');
+                        const details = document.getElementById('attributionDetails');
+                        if (full) full.innerHTML = this.markdownToHtml(accumulated);
+                        if (details) { details.style.display = ''; details.open = true; }
+                    } else if (eventName === 'complete') {
+                        finalData = payload;
+                    }
+                },
             });
             if (!this.isAttributionCurrent(version, requestId)) return;
+            const data = finalData || {};
             const result = {
-                analysis: data.analysis || this.regularAttribution(product, month),
+                analysis: data.analysis || accumulated || this.regularAttribution(product, month),
                 alerts: data.alerts || alerts,
                 important: Boolean(data['重点分析'] || (data.alerts || alerts).length),
                 source: data.analysis_source || 'ai',
@@ -321,6 +359,7 @@ const DashboardPage = {
             this.renderAlerts(result.alerts);
             this.renderAttribution(result.analysis, result.important, result.ragSources);
             this.setTaskGenerationContext({ product, month, conclusion: result.analysis, evidence: result.taskEvidence });
+            console.info('[Dashboard] 归因分析完成', { source: result.source, chars: result.analysis.length });
         } catch (e) {
             if (e.name === 'AbortError') return;
             if (!this.isAttributionCurrent(version, requestId)) return;
@@ -332,6 +371,7 @@ const DashboardPage = {
             };
             this._attributionRenderedVersion = version;
             this.renderAttribution(result.analysis, result.important, result.ragSources);
+            console.warn('[Dashboard] 归因分析降级为规则结果', e);
         }
     },
 
@@ -367,7 +407,7 @@ const DashboardPage = {
         if (!button) return;
         button.disabled = loading;
         button.innerHTML = loading
-            ? '<i data-lucide="loader-circle"></i><span>分析中...</span>'
+            ? '<i data-lucide="loader-2"></i><span>分析中...</span>'
             : '<i data-lucide="refresh-cw"></i><span>重新分析</span>';
         if (typeof refreshIcons === 'function') refreshIcons();
     },
@@ -409,7 +449,7 @@ const DashboardPage = {
         const button = document.getElementById('btnDashboardGenerateTasks');
         if (!button) return;
         button.disabled = true;
-        button.innerHTML = '<i data-lucide="loader-circle"></i><span>生成中...</span>';
+        button.innerHTML = '<i data-lucide="loader-2"></i><span>生成中...</span>';
         try {
             const data = await Utils.api('/api/rpa/generate', {
                 method: 'POST',
@@ -447,7 +487,7 @@ const DashboardPage = {
         const notice = document.createElement('div');
         notice.id = 'dashboardTaskGenerationToast';
         notice.className = `operation-toast${success ? '' : ' error'}`;
-        notice.innerHTML = `<i data-lucide="${success ? 'circle-check' : 'circle-alert'}"></i><span>${Utils.escapeHtml(message)}${success ? ' <a href="#rpa">查看任务</a>' : ''}</span>`;
+        notice.innerHTML = `<i data-lucide="${success ? 'check-circle' : 'alert-circle'}"></i><span>${Utils.escapeHtml(message)}${success ? ' <a href="#rpa">查看任务</a>' : ''}</span>`;
         document.body.appendChild(notice);
         if (typeof refreshIcons === 'function') refreshIcons();
         setTimeout(() => notice.remove(), 6000);
@@ -504,12 +544,11 @@ const DashboardPage = {
         const sources = document.getElementById('attributionSources');
         if (!full || !details) return;
         const normalized = String(text || '').replace(/\r/g, '').trim() || '暂无归因分析';
-        const sentences = normalized.split(/(?<=[。！？；])\s*|\n+/).map(s => s.trim()).filter(Boolean);
         full.innerHTML = this.markdownToHtml(normalized);
         details.style.display = '';
-        // 短文本直接展开，长文本默认折叠，避免无阈值时正文不可见。
-        details.open = sentences.length <= 2 && normalized.length <= 240;
-        details.querySelector('summary').textContent = details.open ? '收起归因分析' : '展开完整归因分析';
+        // 生成完成后保持正文展开，用户仍可手动收起。
+        details.open = true;
+        details.querySelector('summary').textContent = '收起归因分析';
         if (badge) badge.style.display = important ? '' : 'none';
         if (sources) {
             const uniqueSources = [...new Set((ragSources || []).map(source => String(source || '').trim()).filter(Boolean))];
@@ -583,8 +622,8 @@ const DashboardPage = {
         if (!card || !list) return;
         card.style.display = '';
         list.innerHTML = alerts.length
-            ? alerts.map(alert => `<div class="alert-item ${alert.direction === '↑' ? 'alert-up' : 'alert-down'}"><i data-lucide="triangle-alert"></i><span>${Utils.escapeHtml(alert.message || `${alert.metric || '指标'} 环比${alert.direction || ''}${Math.abs(alert.change || 0)}%`)}</span></div>`).join('')
-            : '<div class="attribution-normal"><i data-lucide="circle-check"></i><span>本月未发现超过阈值的成本波动，以下为常规归因分析。</span></div>';
+            ? alerts.map(alert => `<div class="alert-item ${alert.direction === '↑' ? 'alert-up' : 'alert-down'}"><i data-lucide="alert-triangle"></i><span>${Utils.escapeHtml(alert.message || `${alert.metric || '指标'} 环比${alert.direction || ''}${Math.abs(alert.change || 0)}%`)}</span></div>`).join('')
+            : '<div class="attribution-normal"><i data-lucide="check-circle"></i><span>本月未发现超过阈值的成本波动，以下为常规归因分析。</span></div>';
         if (typeof refreshIcons === 'function') refreshIcons();
     },
 
@@ -639,14 +678,8 @@ const DashboardPage = {
             metaEl.innerHTML = '';
             return;
         }
-        // 成本指标：下降为好(.up 绿色)，上升为坏(.down 红色)
-        // 产量指标：上升为好，下降为坏
-        let cls;
-        if (costMetric) {
-            cls = momPct < 0 ? 'up' : (momPct > 0 ? 'down' : 'neutral');
-        } else {
-            cls = momPct > 0 ? 'up' : (momPct < 0 ? 'down' : 'neutral');
-        }
+        // 看板环比统一按方向着色：下降绿色、上升红色、持平灰色。
+        const cls = momPct < 0 ? 'up' : (momPct > 0 ? 'down' : 'neutral');
         const arrow = momPct > 0 ? '↑' : (momPct < 0 ? '↓' : '→');
         const sign = momPct > 0 ? '+' : '';
         metaEl.innerHTML = `<span class="kpi-delta ${cls}">${arrow} ${sign}${momPct.toFixed(2)}% 环比</span>`;
@@ -755,6 +788,102 @@ const DashboardPage = {
         });
     },
 
+    /* ============ 下月成本预测 ============ */
+    async loadForecast(product, version, method) {
+        const requestId = ++this._forecastRequestId;
+        const select = document.getElementById('forecastMethod');
+        const selectedMethod = method || (select && select.value) || 'moving_average';
+        const content = document.getElementById('forecastContent');
+        if (content) content.innerHTML = Utils.inlineLoading('正在计算下月预测...');
+        try {
+            const data = await Utils.api(`/api/dashboard/forecast?${Utils.qs({ product, method: selectedMethod })}`);
+            if (!this.isCurrent(version) || requestId !== this._forecastRequestId) return;
+            if (data.error || !data.forecasts || !data.history || !data.history.length) {
+                throw new Error(data.error || '历史数据不足，暂时无法预测');
+            }
+            this.renderForecast(data);
+        } catch (e) {
+            if (!this.isCurrent(version) || requestId !== this._forecastRequestId) return;
+            this.renderForecastError(e.message || '预测接口暂不可用');
+        }
+    },
+
+    renderForecast(data) {
+        const content = document.getElementById('forecastContent');
+        if (!content) return;
+        const methodLabel = data.method === 'linear_regression' ? '简单线性回归' : '移动平均';
+        const caption = document.getElementById('forecastCaption');
+        if (caption) caption.textContent = `${methodLabel} · ${data.last_month || '-'} 预测 ${data.next_month || '下月'}，区间为统计估算范围`;
+        const labels = {
+            material: '直接材料',
+            labor: '直接人工',
+            overhead: '制造费用',
+            unit_cost: '单位成本',
+        };
+        const cards = Object.entries(labels).map(([key, label]) => {
+            const item = data.forecasts[key] || {};
+            const history = data.history || [];
+            const last = history.length ? Number(history[history.length - 1][key]) : null;
+            const forecast = Number(item.forecast);
+            const delta = Number.isFinite(last) && Number.isFinite(forecast) && last !== 0 ? ((forecast - last) / last) * 100 : null;
+            const deltaClass = delta === null ? 'neutral' : (delta > 0.05 ? 'down' : (delta < -0.05 ? 'up' : 'neutral'));
+            const deltaText = delta === null ? '暂无环比' : `${delta > 0 ? '+' : ''}${delta.toFixed(2)}% 对比上月`;
+            return `<div class="forecast-metric">
+                <div class="forecast-metric-label">${label}</div>
+                <div class="forecast-metric-value">${Number.isFinite(forecast) ? Utils.fmtNum(forecast, 2) : '-' }<span> 元/盒</span></div>
+                <div class="forecast-metric-range">区间 ${Utils.fmtNum(item.confidence_low, 2)} — ${Utils.fmtNum(item.confidence_high, 2)}</div>
+                <span class="kpi-delta ${deltaClass}">${deltaText}</span>
+            </div>`;
+        }).join('');
+        content.innerHTML = `<div class="forecast-chart-wrap"><div id="chartForecast" style="height:340px;width:100%"></div></div><div class="forecast-metrics">${cards}</div>`;
+        this.renderForecastChart(data);
+        if (window.lucide) lucide.createIcons();
+    },
+
+    renderForecastChart(data) {
+        const dom = document.getElementById('chartForecast');
+        if (!dom) return;
+        let chart = echarts.getInstanceByDom(dom);
+        if (chart) {
+            if (AppState.chartResizeObservers && AppState.chartResizeObservers.chartForecast) {
+                AppState.chartResizeObservers.chartForecast.disconnect();
+                delete AppState.chartResizeObservers.chartForecast;
+            }
+            chart.dispose();
+        }
+        // 预测图使用 SVG 矢量渲染，缩放和导出时文字、线条保持清晰。
+        chart = echarts.init(dom, null, { renderer: 'svg' });
+        AppState.echartsInstances.chartForecast = chart;
+        Utils.observeChartResize('chartForecast', chart, dom);
+        if (!chart) return;
+        const history = data.history || [];
+        const months = history.map(item => item.month).concat(data.next_month || '下月');
+        const actual = history.map(item => Number(item.unit_cost)).concat(null);
+        const predicted = history.map((item, index) => index === history.length - 1 ? Number(item.unit_cost) : null).concat(Number(data.forecasts.unit_cost.forecast));
+        const low = history.map(() => null).concat(Number(data.forecasts.unit_cost.confidence_low));
+        const high = history.map(() => null).concat(Number(data.forecasts.unit_cost.confidence_high));
+        chart.setOption({
+            tooltip: { trigger: 'axis', backgroundColor: 'rgba(255,255,255,0.96)', borderColor: '#e0e0e0', textStyle: { color: '#333' } },
+            legend: { data: ['历史单位成本', '预测单位成本', '预测下界', '预测上界'], top: 0, right: 16 },
+            grid: { left: 60, right: 30, top: 45, bottom: 30 },
+            xAxis: { type: 'category', data: months, axisLabel: { color: '#616161' } },
+            yAxis: { type: 'value', name: '元/盒', axisLabel: { color: '#616161' }, splitLine: { lineStyle: { type: 'dashed', color: '#eee' } } },
+            series: [
+                { name: '历史单位成本', type: 'line', data: actual, smooth: true, symbolSize: 7, lineStyle: { width: 2.5, color: '#1a237e' }, itemStyle: { color: '#1a237e' } },
+                { name: '预测单位成本', type: 'line', data: predicted, smooth: true, symbolSize: 9, lineStyle: { width: 2.5, type: 'dashed', color: '#e65100' }, itemStyle: { color: '#e65100' } },
+                { name: '预测下界', type: 'line', data: low, symbol: 'none', lineStyle: { width: 1, type: 'dashed', color: '#90a4ae' } },
+                { name: '预测上界', type: 'line', data: high, symbol: 'none', lineStyle: { width: 1, type: 'dashed', color: '#90a4ae' } },
+            ]
+        });
+    },
+
+    renderForecastError(message) {
+        const caption = document.getElementById('forecastCaption');
+        if (caption) caption.textContent = '预测服务暂不可用，请检查历史数据或稍后重试';
+        const content = document.getElementById('forecastContent');
+        if (content) content.innerHTML = Utils.emptyState('', message);
+    },
+
     async loadHeatmap(version) {
         try {
             const data = await Utils.api('/api/dashboard/heatmap');
@@ -796,8 +925,10 @@ const DashboardPage = {
         }
         let chart = echarts.getInstanceByDom(dom);
         if (!chart || chart.isDisposed()) {
-            chart = echarts.init(dom);
+            // 与其它看板图表保持一致，使用 SVG 矢量渲染提升高分屏清晰度。
+            chart = echarts.init(dom, null, { renderer: 'svg' });
             AppState.echartsInstances.chartHeatmap = chart;
+            Utils.observeChartResize('chartHeatmap', chart, dom);
         }
         if (!chart || !data) return;
         const values = (data.values && data.values[metric]) || [];
@@ -1082,14 +1213,8 @@ const DashboardPage = {
             const val = cur !== null && cur !== undefined ? Utils.fmtNum(cur, 2) : '--';
             let deltaHtml = '';
             if (change !== null && change !== undefined && !isNaN(change)) {
-                // 人工成本/工时：下降为好；产出：上升为好
-                const isEfficiency = it.key === 'labor_efficiency';
-                let cls;
-                if (isEfficiency) {
-                    cls = change > 0 ? 'up' : (change < 0 ? 'down' : 'neutral');
-                } else {
-                    cls = change < 0 ? 'up' : (change > 0 ? 'down' : 'neutral');
-                }
+                // 看板环比统一按方向着色：下降绿色、上升红色、持平灰色。
+                const cls = change < 0 ? 'up' : (change > 0 ? 'down' : 'neutral');
                 const arrow = change > 0 ? '↑' : (change < 0 ? '↓' : '→');
                 const sign = change > 0 ? '+' : '';
                 deltaHtml = `<span class="kpi-delta ${cls}">${arrow} ${sign}${change.toFixed(2)}% 环比</span>`;

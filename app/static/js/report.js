@@ -5,7 +5,6 @@ const ReportPage = {
     _rendered: false,
     _reportId: null,
     _reportData: null,
-    _outputFormat: 'docx',
 
     render() {
         const container = document.getElementById('page-report');
@@ -28,10 +27,14 @@ const ReportPage = {
 
             <div style="display:grid;grid-template-columns:1fr 2fr;gap:24px">
                 <!-- Left: Report Config -->
-                <div class="card">
-                    <h3 class="card-title" style="margin-bottom:16px">报告参数</h3>
-                    <div style="display:flex;flex-direction:column;gap:16px">
-                        <div class="form-group">
+                <div class="card report-config-card">
+                    <div class="report-config-heading">
+                        <div>
+                            <h3 class="card-title">报告参数</h3>
+                        </div>
+                    </div>
+                    <div class="report-config-fields">
+                        <div class="form-group report-config-field">
                             <label>产品</label>
                             <select id="reportProduct">
                                 ${AppState.products.map(p => {
@@ -40,7 +43,7 @@ const ReportPage = {
                                 }).join('')}
                             </select>
                         </div>
-                        <div class="form-group">
+                        <div class="form-group report-config-field">
                             <label>月份</label>
                             <select id="reportMonth">
                                 ${AppState.months.map(m =>
@@ -48,7 +51,7 @@ const ReportPage = {
                                 ).join('')}
                             </select>
                         </div>
-                        <div class="form-group">
+                        <div class="form-group report-config-field">
                             <label>报告模板</label>
                             <select id="reportType">
                                 <option value="monthly">月度成本分析</option>
@@ -56,15 +59,8 @@ const ReportPage = {
                                 <option value="topic">专题分析</option>
                             </select>
                         </div>
-                        <div class="form-group">
-                            <label>输出格式</label>
-                            <div style="display:flex;gap:8px" id="formatButtons">
-                                <button class="btn btn-secondary btn-sm" type="button" data-format="docx" data-selected="true">Word</button>
-                                <button class="btn btn-secondary btn-sm" type="button" data-format="pdf">PDF</button>
-                            </div>
-                        </div>
                     </div>
-                    <button id="btnGenerate" class="btn btn-primary" style="width:100%;margin-top:20px">
+                    <button id="btnGenerate" class="btn btn-primary report-generate-button">
                         <i data-lucide="sparkles" style="width:16px;height:16px"></i> 生成报告
                     </button>
                 </div>
@@ -74,7 +70,8 @@ const ReportPage = {
                     <div class="card-header">
                         <h3 class="card-title">报告预览</h3>
                         <div style="display:flex;gap:8px">
-                            <button class="btn btn-secondary" id="download-report" disabled><i data-lucide="download" style="width:16px;height:16px"></i> 导出报告</button>
+                            <button class="btn btn-secondary" id="download-report-word" disabled title="导出 Word 文档"><i data-lucide="file-text" style="width:16px;height:16px"></i> 导出 Word</button>
+                            <button class="btn btn-secondary" id="download-report-pdf" disabled title="导出 PDF 文件"><i data-lucide="file-down" style="width:16px;height:16px"></i> 导出 PDF</button>
                         </div>
                     </div>
                     <div class="report-preview" id="reportPreviewContent">
@@ -99,7 +96,8 @@ const ReportPage = {
 
     bindEvents() {
         document.getElementById('btnGenerate').addEventListener('click', () => this.startGenerate());
-        document.getElementById('download-report').addEventListener('click', () => this.exportCurrentReport());
+        document.getElementById('download-report-word').addEventListener('click', () => this.exportReport('docx'));
+        document.getElementById('download-report-pdf').addEventListener('click', () => this.exportReport('pdf'));
 
         const historyList = document.getElementById('historyList');
         if (historyList) {
@@ -111,29 +109,6 @@ const ReportPage = {
             });
         }
 
-        // 输出格式切换（Word / PDF）
-        const fmtButtons = document.querySelectorAll('#formatButtons button');
-        fmtButtons.forEach(btn => {
-            btn.addEventListener('click', () => {
-                fmtButtons.forEach(b => {
-                    b.dataset.selected = 'false';
-                    b.classList.remove('btn-primary');
-                    b.classList.add('btn-secondary');
-                    b.style.boxShadow = '';
-                });
-                btn.dataset.selected = 'true';
-                btn.classList.remove('btn-secondary');
-                btn.classList.add('btn-primary');
-                this._outputFormat = btn.dataset.format;
-            });
-        });
-        // 初始默认选中 Word
-        const defaultBtn = document.querySelector('#formatButtons button[data-format="docx"]');
-        if (defaultBtn) {
-            defaultBtn.classList.remove('btn-secondary');
-            defaultBtn.classList.add('btn-primary');
-            this._outputFormat = 'docx';
-        }
     },
 
     /* ============ 生成报告 ============ */
@@ -141,7 +116,6 @@ const ReportPage = {
         const product = document.getElementById('reportProduct').value;
         const month = document.getElementById('reportMonth').value;
         const reportType = document.getElementById('reportType').value;
-        const outputFormat = this._outputFormat || 'docx';
 
         if (!product || !month) {
             alert('请选择产品和月份');
@@ -166,12 +140,12 @@ const ReportPage = {
         previewContent.innerHTML = `
             <div style="text-align:center;padding:80px 0;color:var(--phc-ink-3)">
                 <div class="spinner-small" style="width:32px;height:32px;border-width:3px;margin:0 auto"></div>
-                <p style="margin-top:12px;font-size:14px">正在生成报告...</p>
+                <p data-report-progress style="margin-top:12px;font-size:14px">正在生成报告...</p>
             </div>
         `;
 
         try {
-            const resp = await fetch(`/api/report/generate?${Utils.qs({ product, month, report_type: reportType, output_format: outputFormat })}`, {
+            const resp = await fetch(`/api/report/generate?${Utils.qs({ product, month, report_type: reportType })}`, {
                 method: 'POST'
             });
             const data = await resp.json();
@@ -192,8 +166,13 @@ const ReportPage = {
 
     async pollReportStatus(taskId) {
         const previewContent = document.getElementById('reportPreviewContent');
+        const startedAt = Date.now();
+        const maxWaitMs = 10 * 60 * 1000;
         for (;;) {
             await new Promise(resolve => setTimeout(resolve, 1200));
+            if (Date.now() - startedAt >= maxWaitMs) {
+                throw new Error('报告生成超时，请检查服务状态后重试');
+            }
             const data = await Utils.api(`/api/report/${encodeURIComponent(taskId)}/status`, { timeoutMs: 15000 });
             this._reportData = data;
             if (data.status === 'completed') {
@@ -238,7 +217,7 @@ const ReportPage = {
                 <span class="status-pill success"><i data-lucide="check-circle" style="width:14px;height:14px"></i> 报告生成成功</span>
                 <span style="margin-left:8px;font-size:12px;color:var(--phc-ink-3)">${safe(previewTitle)} · 产品：${safe(data.product || product)} · 月份：${safe(data.month || month)}</span>
             </div>
-            ${sections.length ? sections.map(section => `<div class="report-section"><h4>${safe(section.title)}</h4><div class="report-markdown">${this._renderPreviewText(section.content)}</div></div>`).join('') : '<div class="empty-state"><p>报告已生成，但预览内容为空，请下载 Word 查看完整报告。</p></div>'}
+            ${sections.length ? sections.map(section => `<div class="report-section"><h4>${safe(section.title)}</h4><div class="report-markdown">${this._renderPreviewText(section.content)}</div></div>`).join('') : '<div class="empty-state"><p>报告已生成，但预览内容为空，请导出 Word 或 PDF 查看完整报告。</p></div>'}
             ${references.length ? `<div class="rag-citation report-rag-citation"><i data-lucide="book-open"></i><span>知识库来源：${references.map(safe).join('；')}</span></div>` : ''}
         `;
         this.setDownloadState(true);
@@ -350,13 +329,15 @@ const ReportPage = {
     },
 
     setDownloadState(enabled) {
-        const button = document.getElementById('download-report');
-        if (button) button.disabled = !enabled;
+        ['download-report-word', 'download-report-pdf'].forEach(id => {
+            const button = document.getElementById(id);
+            if (button) button.disabled = !enabled;
+        });
     },
 
-    async exportCurrentReport() {
+    async exportReport(format) {
         try {
-            await this.download(this._outputFormat || 'docx');
+            await this.download(format);
         } catch (error) {
             if (error && error.name === 'AbortError') {
                 return;
@@ -427,7 +408,7 @@ const ReportPage = {
             <div style="text-align:center;padding:40px 0">
                 <span class="status-pill error"><i data-lucide="alert-circle" style="width:14px;height:14px"></i> 报告生成失败</span>
                 <p style="margin-top:12px;font-size:13px;color:var(--phc-ink-3)">${message}</p>
-                <button class="btn btn-secondary" style="margin-top:16px" onclick="ReportPage.startGenerate()">重试</button>
+                <button class="btn btn-secondary" style="margin-top:16px" onclick="ReportPage.startGenerate()"><i data-lucide="refresh-ccw" style="width:16px;height:16px"></i>重试</button>
             </div>
         `;
         if (window.lucide) lucide.createIcons();
@@ -465,7 +446,7 @@ const ReportPage = {
                 <td>
                     <a href="/api/report/${encodedId}/download?format=docx" class="btn btn-sm btn-outline" download>Word</a>
                     <a href="/api/report/${encodedId}/download?format=pdf" class="btn btn-sm btn-outline" download>PDF</a>
-                    <button type="button" class="btn btn-sm btn-outline" data-delete-task="${safe(taskId)}" style="color:var(--phc-state-error);border-color:var(--phc-state-error)">删除</button>
+                    <button type="button" class="btn btn-sm btn-outline" data-delete-task="${safe(taskId)}" style="color:var(--phc-state-error);border-color:var(--phc-state-error)" aria-label="删除报告 ${safe(taskId)}" title="删除报告"><i data-lucide="trash-2" aria-hidden="true"></i><span>删除</span></button>
                 </td>
             </tr>`;
         });

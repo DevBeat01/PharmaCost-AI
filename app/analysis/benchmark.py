@@ -17,7 +17,7 @@ logger = logging.getLogger("benchmark")
 _ATTRIBUTION_CACHE_PATH = Path(__file__).resolve().parent.parent / "output" / "benchmark_attribution_cache.json"
 _ATTRIBUTION_CACHE_LOCK = threading.Lock()
 # 归因格式规范化逻辑变更后，旧缓存需要重新生成。
-_ATTRIBUTION_CACHE_VERSION = 4
+_ATTRIBUTION_CACHE_VERSION = 5
 
 
 def _attribution_cache_key(product: str, month: str) -> str:
@@ -75,24 +75,24 @@ def _build_attribution_fallback(diff_data: dict) -> str:
     amount = abs(float(unit.get("diff_amount", 0)))
     rate = float(unit.get("diff_rate", 0))
     lines = [
-        "## 结论摘要",
+        "1. 结论摘要",
         f"单位成本{direction}{amount:.2f}元/盒（差异率{rate:+.2f}%）。",
-        "## 重点分析",
+        "2. 重点分析",
     ]
-    for row in factor_rows:
+    for index, row in enumerate(factor_rows, 1):
         lines.append(
-            f"- {row['dimension']}：一厂{row['factory1']:.2f}元/盒，二厂{row['factory2']:.2f}元/盒，"
+            f"2.{index} {row['dimension']}：一厂{row['factory1']:.2f}元/盒，二厂{row['factory2']:.2f}元/盒，"
             f"差异{row['diff_amount']:+.2f}元/盒（{row['diff_rate']:+.2f}%）。具体业务原因需结合采购、工艺和设备记录核查。"
         )
-    lines.extend(["## 改进建议", "- 按差异贡献度优先核查成本要素的采购价格、单耗、人工效率和费用分摊依据。"])
-    return "\n\n".join(lines) + "\n\n> 本结论仅基于成本数据。"
+    lines.extend(["3. 改进建议", "3.1 按差异贡献度优先核查成本要素的采购价格、单耗、人工效率和费用分摊依据。"])
+    return "\n\n".join(lines) + "\n\n注：本结论仅基于成本数据。"
 
 
 def _ensure_data_only_notice(text: str, rag_sources: list[str] | None) -> str:
     if rag_sources:
         return text
     marker = "本结论仅基于成本数据"
-    return text if marker in text else f"{text.rstrip()}\n\n> {marker}。"
+    return text if marker in text else f"{text.rstrip()}\n\n注：{marker}。"
 
 
 def _default_suggestions(product: str, month: str, diff_data: dict) -> list[dict]:
@@ -127,13 +127,13 @@ def _default_suggestions(product: str, month: str, diff_data: dict) -> list[dict
 
 
 def _extract_suggestions(attribution: str, product: str, month: str, diff_data: dict) -> list[dict]:
-    """仅提取“改进建议”章节的列表项，避免正文/表格被误生成为任务。"""
+    """仅提取数字编号的“改进建议”章节，避免正文被误生成为任务。"""
     text = str(attribution or "")
-    match = re.search(r"^\s*##\s*改进建议\s*$([\s\S]*?)(?=^\s*#{1,2}\s+|\Z)", text, re.MULTILINE)
+    match = re.search(r"^\s*3\.\s*改进建议\s*$([\s\S]*?)(?=^\s*\d+\.\s+[^\n]+\s*$|\Z)", text, re.MULTILINE)
     section = match.group(1) if match else ""
     items = []
     for line in section.splitlines():
-        bullet = re.match(r"^\s*(?:[-*•]|\d+[.)、])\s+(.+)$", line)
+        bullet = re.match(r"^\s*(?:3[.、]\d+|[-*•]|\d+[.)、])\s+(.+)$", line)
         if not bullet or "|" in line:
             continue
         value = re.sub(r"(?:\*\*|__|`)", "", bullet.group(1)).strip()
@@ -181,9 +181,9 @@ def _normalize_model_attribution(text: str) -> str | None:
         "改进建议": "改进建议",
         "建议": "改进建议",
     }
-    # 支持 ##、###、中文序号和标题后的括号说明/冒号说明。
+    # 支持 ##、###、中英文数字序号和标题后的括号说明/冒号说明。
     heading_re = re.compile(
-        r"^\s*(?:#{1,6}\s*)?(?:[一二三四五六七八九十百]+[、.)．.]\s*)?"
+        r"^\s*(?:#{1,6}\s*)?(?:[一二三四五六七八九十百0-9]+[、.)．.]\s*)?"
         r"(?:\*\*|__)?\s*(结论摘要|总体结论|结论|重点分析|常规分析|差异分析|改进建议|建议)"
         r"\s*(?:\*\*|__)?(?:\s*[:：\-—（(].*)?\s*$"
     )
@@ -215,7 +215,7 @@ def _normalize_model_attribution(text: str) -> str | None:
         return None
 
     normalized = []
-    for heading, body_lines in sections:
+    for section_index, (heading, body_lines) in enumerate(sections, 1):
         # 去掉模型残留的强调标记，保留正文语义；前端无需再显示 Markdown 源码。
         cleaned_lines = []
         for raw_line in body_lines:
@@ -237,7 +237,33 @@ def _normalize_model_attribution(text: str) -> str | None:
         body = body.strip()
         if not body:
             return None
-        normalized.extend([f"## {heading}", body])
+        normalized.append(f"{section_index}. {heading}")
+        if section_index == 1:
+            # 摘要只保留一个段落，前端按纯文本展示而非 Markdown。
+            normalized.append(re.sub(r"\s+", " ", re.sub(r"^\s*(?:[-*•]|\d+[.)、])\s*", "", body)).strip())
+            continue
+
+        items, current = [], ""
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            bullet = re.match(r"^\s*(?:[-*•]|\d+(?:[.、]\d+)?[.)、]?)\s+(.+)$", line)
+            if bullet:
+                if current:
+                    items.append(current)
+                current = bullet.group(1).strip()
+            elif current:
+                current = f"{current} {line}"
+            else:
+                current = line
+        if current:
+            items.append(current)
+        if not items:
+            return None
+        for item_index, item in enumerate(items, 1):
+            item = re.sub(r"\s+", " ", item).strip()
+            normalized.append(f"{section_index}.{item_index} {item}")
     return "\n\n".join(normalized)
 
 
@@ -448,3 +474,85 @@ async def benchmark_attribution(product: str, month: str, force: bool = False) -
         'analysis_source': source,
         'cached': False,
     }
+
+
+def benchmark_attribution_stream(product: str, month: str, force: bool = False):
+    """以 SSE 事件片段生成对标归因，结果结构与 benchmark_attribution 一致。"""
+    diff_data = benchmark_diff(product, month)
+    if 'error' in diff_data:
+        yield {'event': 'complete', 'data': diff_data}
+        return
+
+    def result_payload(attribution, suggestions, rag_sources, source, cached):
+        return {
+            'product': product, 'month': month, 'diff_data': diff_data,
+            'attribution': attribution, 'suggestions': suggestions,
+            'rag_sources': rag_sources, 'rag_used': bool(rag_sources),
+            'knowledge_base_version': 'knowledge_index_meta',
+            'analysis_source': source, 'cached': cached,
+        }
+
+    def replay(text):
+        for start in range(0, len(text), 32):
+            yield {'event': 'chunk', 'data': {'text': text[start:start + 32]}}
+
+    if not force:
+        cached = _get_cached_attribution(product, month)
+        if cached:
+            attribution = _ensure_data_only_notice(cached['attribution'], cached.get('rag_sources'))
+            suggestions = cached.get('suggestions') or _default_suggestions(product, month, diff_data)
+            yield {'event': 'meta', 'data': {'product': product, 'month': month, 'diff_data': diff_data, 'rag_sources': cached.get('rag_sources', [])}}
+            yield from replay(attribution)
+            yield {'event': 'complete', 'data': result_payload(attribution, suggestions, cached.get('rag_sources', []), cached.get('analysis_source', 'cache'), True)}
+            return
+
+    try:
+        from rag.retriever import hybrid_search
+        rag_results = hybrid_search(f"{product} 生产工艺 设备 成本差异 对标分析", top_k=3)
+    except Exception:
+        logger.exception("RAG检索失败")
+        rag_results = []
+    rag_sources = source_names(rag_results)
+    context = f"产品: {product}, 月份: {month}\n对标差异数据:\n"
+    contribution_map = {
+        item.get("dimension"): item.get("contribution")
+        for item in benchmark_breakdown(product, month).get("breakdown", [])
+    }
+    for row in diff_data['rows']:
+        contribution = contribution_map.get(row['dimension'])
+        contribution_text = f", 贡献度{contribution}%" if contribution is not None else ""
+        context += (
+            f"- {row['dimension']}: 一厂{row['factory1']}, 二厂{row['factory2']}, "
+            f"差异{row['diff_amount']}({row['direction']}), 差异率{row['diff_rate']}%{contribution_text}\n"
+        )
+    rag_context = "\n".join(
+        f"[{i + 1}] (来源: {item.get('source', '知识库')}) {item.get('content', '')[:300]}"
+        for i, item in enumerate(rag_results)
+    )
+    yield {'event': 'meta', 'data': {'product': product, 'month': month, 'diff_data': diff_data, 'rag_sources': rag_sources}}
+    attribution = ''
+    source = 'ai'
+    try:
+        from llm.client import llm_client
+        from llm.prompts import BENCHMARK_ATTRIBUTION_PROMPT, SYSTEM_ROLE
+        prompt = BENCHMARK_ATTRIBUTION_PROMPT.format(context=context, rag_context=rag_context)
+        for chunk in llm_client.chat_stream(prompt, system=SYSTEM_ROLE):
+            if chunk:
+                attribution += str(chunk)
+                yield {'event': 'chunk', 'data': {'text': str(chunk)}}
+        if not attribution.strip():
+            raise RuntimeError('LLM未返回归因文本')
+        normalized = _normalize_model_attribution(attribution)
+        if normalized is None:
+            attribution = _build_attribution_fallback(diff_data)
+            source = 'normalized_fallback'
+        else:
+            attribution = normalized
+    except Exception:
+        logger.exception("LLM归因分析生成失败")
+        attribution = _build_attribution_fallback(diff_data)
+        source = 'fallback'
+    suggestions = _extract_suggestions(attribution, product, month, diff_data)
+    attribution = _ensure_data_only_notice(attribution, rag_sources)
+    _cache_attribution(product, month, attribution, suggestions, rag_sources, source)
+    yield {'event': 'complete', 'data': result_payload(attribution, suggestions, rag_sources, source, False)}

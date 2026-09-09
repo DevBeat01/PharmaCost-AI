@@ -1,5 +1,7 @@
 """对标分析API路由"""
+import json
 from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 from security import validate_product, validate_month
 
 router = APIRouter()
@@ -41,3 +43,23 @@ async def get_attribution(
     month = validate_month(month)
     from analysis.benchmark import benchmark_attribution
     return await benchmark_attribution(product, month, force=force)
+
+
+@router.get("/attribution/stream")
+async def get_attribution_stream(
+    product: str = Query(...), month: str = Query(...), force: bool = Query(False)
+):
+    """以 SSE 流式返回对标归因文本。"""
+    product = validate_product(product)
+    month = validate_month(month)
+    from analysis.benchmark import benchmark_attribution_stream
+
+    def events():
+        for item in benchmark_attribution_stream(product, month, force):
+            yield f"event: {item.get('event', 'message')}\ndata: {json.dumps(item.get('data', {}), ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    })

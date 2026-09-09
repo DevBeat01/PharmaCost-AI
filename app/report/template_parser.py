@@ -66,7 +66,7 @@ class TemplateParser:
             key = match.group(1)
             if key not in mapping:
                 continue
-            repl = str(mapping[key])
+            repl = self._clean_markdown_text(mapping[key])
             mstart, mend = match.start(), match.end()
 
             # 找出涉及的run
@@ -165,11 +165,11 @@ class TemplateParser:
                 pass
         self._set_table_borders(table)
         for idx, value in enumerate(headers):
-            table.rows[0].cells[idx].text = str(value)
+            table.rows[0].cells[idx].text = self._clean_markdown_text(value)
         for row in rows:
             cells = table.add_row().cells
             for idx, value in enumerate(row):
-                cells[idx].text = str(value)
+                cells[idx].text = self._clean_markdown_text(value)
         anchor = para._element if hasattr(para, '_element') else para
         anchor.addnext(table._element)
         self._format_table(table)
@@ -236,12 +236,13 @@ class TemplateParser:
         anchor_el.addnext(paragraph_el)
         paragraph = Paragraph(paragraph_el, self.doc._body)
         if text:
-            paragraph.add_run(text)
+            paragraph.add_run(self._clean_markdown_text(text))
         return paragraph
 
     def _insert_text_block_after(self, anchor, text, replace_anchor=False):
         """将模型返回的多行文本拆为独立 Word 段落，返回最后一个锚点。"""
-        lines = [line.strip() for line in str(text or '').splitlines() if line.strip()]
+        cleaned = self._clean_markdown_text(text)
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
         if not lines:
             if replace_anchor:
                 self._set_paragraph_text(anchor, '')
@@ -267,7 +268,27 @@ class TemplateParser:
             para.add_run(str(text))
 
     @staticmethod
-    def _set_run_font(run, size=10.5, bold=None, color='263746', italic=False):
+    def _clean_markdown_text(value):
+        """清理模型输出中的 Markdown 源码，保留可读文本。"""
+        text = str(value or '').replace('\r\n', '\n').replace('\r', '\n')
+        text = re.sub(r'```(?:[\w+-]+)?\s*\n?', '', text)
+        text = text.replace('```', '')
+        text = re.sub(r'^\s{0,3}#{1,6}\s*', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*>\s?', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*[-*+]\s+', '• ', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*\d+[.)]\s+', '• ', text, flags=re.MULTILINE)
+        text = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'__(.*?)__', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'~~(.*?)~~', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'(?<!\*)\*(?!\s)(.*?)(?<!\s)\*', r'\1', text)
+        text = re.sub(r'(?<!_)_(?!\s)(.*?)(?<!\s)_', r'\1', text)
+        text = re.sub(r'`([^`]+)`', r'\1', text)
+        text = re.sub(r'^\s*[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+        return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+    @staticmethod
+    def _set_run_font(run, size=10.5, bold=None, color='000000', italic=False):
         run.font.name = '宋体'
         run._element.get_or_add_rPr().get_or_add_rFonts().set(qn('w:eastAsia'), '宋体')
         run.font.size = Pt(size)
@@ -291,6 +312,8 @@ class TemplateParser:
             return 'heading2'
         if value.startswith(('• ', '- ', '* ')):
             return 'bullet'
+        if len(value) <= 42 and re.match(r'^(?:重点|需关注|建议|异常|风险|结论|核心|注意)\s*[:：]?', value):
+            return 'heading3'
         if len(value) <= 28 and re.search(r'(分析|概览|小结|结论|建议|预警|判断|汇总|变化|推算|说明|因素)$', value):
             return 'heading3'
         return 'body'
@@ -308,24 +331,24 @@ class TemplateParser:
             fmt.space_after = Pt(10)
             para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             for run in para.runs:
-                cls._set_run_font(run, 17, True, '17324D')
+                cls._set_run_font(run, 17, True, '000000')
         elif role == 'heading1':
             fmt.space_before = Pt(13)
             fmt.space_after = Pt(5)
             para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             for run in para.runs:
-                cls._set_run_font(run, 15, True, '17324D')
+                cls._set_run_font(run, 15, True, '000000')
         elif role == 'heading2':
             fmt.space_before = Pt(9)
             fmt.space_after = Pt(4)
             para.alignment = WD_ALIGN_PARAGRAPH.LEFT
             for run in para.runs:
-                cls._set_run_font(run, 12, True, '245B7A')
+                cls._set_run_font(run, 12, True, '000000')
         elif role == 'heading3':
             fmt.space_before = Pt(6)
             fmt.space_after = Pt(2)
             for run in para.runs:
-                cls._set_run_font(run, 11, True, '315B73')
+                cls._set_run_font(run, 11, True, '000000')
         elif role == 'bullet':
             fmt.left_indent = Pt(14)
             fmt.first_line_indent = Pt(-10)
@@ -338,7 +361,7 @@ class TemplateParser:
             fmt.space_after = Pt(7)
             fmt.left_indent = Pt(8)
             for run in para.runs:
-                cls._set_run_font(run, 9, False, '617284', italic=True)
+                cls._set_run_font(run, 9, False, '000000', italic=True)
         else:
             fmt.left_indent = Pt(0)
             fmt.first_line_indent = Pt(0)
@@ -372,7 +395,7 @@ class TemplateParser:
                     para.paragraph_format.line_spacing = 1.0
                     para.alignment = WD_ALIGN_PARAGRAPH.CENTER if ri == 0 else WD_ALIGN_PARAGRAPH.LEFT
                     for run in para.runs:
-                        cls._set_run_font(run, 9.2, ri == 0, '17324D' if ri == 0 else '263746')
+                        cls._set_run_font(run, 9.2, ri == 0, '000000')
 
     def _format_report_document(self):
         """对生成报告正文统一排版，保留封面与模板控制信息的原有布局。"""
@@ -678,10 +701,12 @@ class TemplateParser:
             sz.set(qn('w:val'), '20')  # 10pt
             szCs = etree.SubElement(rPr, qn('w:szCs'))
             szCs.set(qn('w:val'), '20')
+            color = etree.SubElement(rPr, qn('w:color'))
+            color.set(qn('w:val'), '000000')
 
             t = etree.SubElement(r, qn('w:t'))
             t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            t.text = text
+            t.text = TemplateParser._clean_markdown_text(text)
 
     def find_and_insert_new_table(self, placeholder: str, headers: list[str],
                                   data_rows: list[list[str]]) -> bool:
@@ -694,9 +719,56 @@ class TemplateParser:
     def save(self, output_path):
         """保存文档"""
         self._format_report_document()
+        self._force_black_fonts()
         self._remove_cover_wordart()
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         self.doc.save(output_path)
+
+    def _force_black_fonts(self):
+        """统一正文、表格及页眉页脚字体颜色为黑色，保留原有加粗。"""
+        def format_part(part):
+            for para in part.paragraphs:
+                for run in para.runs:
+                    run.font.color.rgb = RGBColor(0, 0, 0)
+            for table in part.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        format_part(cell)
+
+        format_part(self.doc)
+        for section in self.doc.sections:
+            for part in (
+                section.header, section.first_page_header, section.even_page_header,
+                section.footer, section.first_page_footer, section.even_page_footer,
+            ):
+                format_part(part)
+
+        # python-docx 不会把超链接、文本框等特殊容器中的 run 暴露到
+        # ``paragraphs``，直接遍历 XML 可避免模板样式把这些文字渲染成蓝色。
+        def format_xml_runs(root):
+            for run in root.iter(qn('w:r')):
+                rpr = run.find(qn('w:rPr'))
+                if rpr is None:
+                    rpr = self._new_xml_element('w:rPr')
+                    run.insert(0, rpr)
+                color = rpr.find(qn('w:color'))
+                if color is None:
+                    color = self._new_xml_element('w:color')
+                    rpr.append(color)
+                color.set(qn('w:val'), '000000')
+
+        format_xml_runs(self.doc.element)
+        for section in self.doc.sections:
+            for part in (
+                section.header, section.first_page_header, section.even_page_header,
+                section.footer, section.first_page_footer, section.even_page_footer,
+            ):
+                format_xml_runs(part._element)
+
+    @staticmethod
+    def _new_xml_element(tag):
+        from docx.oxml import OxmlElement
+        return OxmlElement(tag)
 
     def _remove_cover_wordart(self):
         """移除封面页中易被 WPS 错误栅格化的 VML WordArt 水印。

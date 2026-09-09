@@ -15,6 +15,25 @@ _FONT_NAME = "SimHei"
 _FONT_PATHS = ("C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/simsunb.ttf")
 
 
+def _clean_text(value):
+    """清理 PDF 备用导出中的 Markdown 源码。"""
+    text = str(value or '').replace('\r\n', '\n').replace('\r', '\n')
+    text = re.sub(r'```(?:[\w+-]+)?\s*\n?', '', text)
+    text = text.replace('```', '')
+    text = re.sub(r'^\s{0,3}#{1,6}\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*>\s?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*[-*+]\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+[.)]\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'__(.*?)__', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'~~(.*?)~~', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'(?<!\*)\*(?!\s)(.*?)(?<!\s)\*', r'\1', text)
+    text = re.sub(r'(?<!_)_(?!\s)(.*?)(?<!\s)_', r'\1', text)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+
 def _load_reportlab():
     try:
         from reportlab.lib import colors
@@ -128,24 +147,24 @@ def export_pdf(report: dict, output_path: str, docx_path: str = ""):
 
     font = _font_name(pdfmetrics, TTFont)
     styles = getSampleStyleSheet()
-    title = ParagraphStyle("ReportTitle", parent=styles["Title"], fontName=font, alignment=TA_CENTER, fontSize=20, leading=28, textColor=colors.HexColor("#17324d"))
-    heading = ParagraphStyle("ReportHeading", parent=styles["Heading2"], fontName=font, fontSize=13, leading=19, textColor=colors.HexColor("#17324d"), spaceBefore=10, spaceAfter=6)
-    body = ParagraphStyle("ReportBody", parent=styles["BodyText"], fontName=font, fontSize=9.5, leading=16, textColor=colors.HexColor("#263746"), wordWrap="CJK")
-    meta = ParagraphStyle("ReportMeta", parent=body, alignment=TA_CENTER, textColor=colors.HexColor("#617284"))
+    title = ParagraphStyle("ReportTitle", parent=styles["Title"], fontName=font, alignment=TA_CENTER, fontSize=20, leading=28, textColor=colors.black)
+    heading = ParagraphStyle("ReportHeading", parent=styles["Heading2"], fontName=font, fontSize=13, leading=19, textColor=colors.black, spaceBefore=10, spaceAfter=6)
+    body = ParagraphStyle("ReportBody", parent=styles["BodyText"], fontName=font, fontSize=9.5, leading=16, textColor=colors.black, wordWrap="CJK")
+    meta = ParagraphStyle("ReportMeta", parent=body, alignment=TA_CENTER, textColor=colors.black)
     doc = SimpleDocTemplate(output_path, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm, topMargin=18 * mm, bottomMargin=18 * mm, title=report.get("title", "成本分析报告"), author="制药成本智能分析系统")
 
     def draw_header_footer(canvas, _doc):
         canvas.saveState()
         canvas.setFont(font, 8)
-        canvas.setFillColor(colors.HexColor("#617284"))
+        canvas.setFillColor(colors.black)
         canvas.drawString(18 * mm, 10 * mm, "制药成本智能分析报告")
         canvas.drawRightString(A4[0] - 18 * mm, 10 * mm, f"第 {canvas.getPageNumber()} 页")
         canvas.restoreState()
 
     generated_at = report.get("generated_at") or report.get("created_at") or ""
-    story = [Spacer(1, 28 * mm), Paragraph(report.get("title", "成本分析报告"), title), Spacer(1, 8 * mm), Paragraph(f"产品：{report.get('product', '')}　分析月份：{report.get('month', '')}", meta)]
+    story = [Spacer(1, 28 * mm), Paragraph(escape(_clean_text(report.get("title", "成本分析报告"))), title), Spacer(1, 8 * mm), Paragraph(escape(_clean_text(f"产品：{report.get('product', '')}　分析月份：{report.get('month', '')}")), meta)]
     if generated_at:
-        story.extend([Spacer(1, 3 * mm), Paragraph(f"编制时间：{generated_at}", meta)])
+        story.extend([Spacer(1, 3 * mm), Paragraph(escape(_clean_text(f"编制时间：{generated_at}")), meta)])
     story.append(Spacer(1, 18 * mm))
 
     # Word 转换不可用时，直接读取 DOCX 的 body，完整保留模板章节和动态表格。
@@ -167,21 +186,21 @@ def export_pdf(report: dict, output_path: str, docx_path: str = ""):
                     if not text:
                         continue
                     if len(text) <= 42 and '成本分析' in text and text.endswith('报告'):
-                        body_story.append(Paragraph(escape(text), title))
+                        body_story.append(Paragraph(escape(_clean_text(text)), title))
                     elif re.match(r'^(?:[一二三四五六七八九十]+、|第[一二三四五六七八九十]+章)', text):
-                        body_story.append(Paragraph(escape(text), heading))
+                        body_story.append(Paragraph(escape(_clean_text(text)), heading))
                     elif re.match(r'^\d+\.\d+(?:\.\d+)?(?:\s+|$)', text):
-                        body_story.append(Paragraph(escape(text), heading))
+                        body_story.append(Paragraph(escape(_clean_text(text)), heading))
                     elif text.startswith('知识库参考：'):
-                        body_story.append(Paragraph(escape(text), meta))
+                        body_story.append(Paragraph(escape(_clean_text(text)), meta))
                     else:
-                        body_story.append(Paragraph(escape(text).replace('\n', '<br/>'), body))
+                        body_story.append(Paragraph(escape(_clean_text(text)).replace('\n', '<br/>'), body))
                     body_story.append(Spacer(1, 2 * mm))
                 elif tag == 'tbl':
                     table = DocxTable(element, word_doc._body)
                     rows = []
                     for row in table.rows:
-                        rows.append([Paragraph(escape(cell.text.strip()).replace('\n', '<br/>'), body) for cell in row.cells])
+                        rows.append([Paragraph(escape(_clean_text(cell.text.strip())).replace('\n', '<br/>'), body) for cell in row.cells])
                     if rows and rows[0]:
                         col_count = len(rows[0])
                         col_width = (A4[0] - 36 * mm) / max(1, col_count)
@@ -247,7 +266,7 @@ def export_pdf(report: dict, output_path: str, docx_path: str = ""):
                     i += 1
                 rows = table_rows(table_lines)
                 if rows:
-                    data = [[Paragraph(escape(str(cell)), body) for cell in row] for row in rows]
+                    data = [[Paragraph(escape(_clean_text(cell)), body) for cell in row] for row in rows]
                     col_width = 163 * mm / max(1, len(rows[0]))
                     table = Table(data, colWidths=[col_width] * len(rows[0]), repeatRows=1)
                     table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")), ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#c6d2dc")), ("FONTNAME", (0, 0), (-1, -1), font), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5)]))
@@ -257,13 +276,13 @@ def export_pdf(report: dict, output_path: str, docx_path: str = ""):
                 i = start
             paragraph = lines[i].strip()
             if paragraph:
-                story.append(Paragraph(escape(paragraph), body))
+                story.append(Paragraph(escape(_clean_text(paragraph)), body))
                 story.append(Spacer(1, 2 * mm))
             i += 1
     references = report.get("references", [])
     if references:
         story.append(Paragraph("知识库来源", heading))
-        data = [[Paragraph("序号", body), Paragraph("来源", body)]] + [[Paragraph(str(i), body), Paragraph(str(ref).replace("&", "&amp;"), body)] for i, ref in enumerate(references, 1)]
+        data = [[Paragraph("序号", body), Paragraph("来源", body)]] + [[Paragraph(str(i), body), Paragraph(escape(_clean_text(ref)), body)] for i, ref in enumerate(references, 1)]
         table = Table(data, colWidths=[18 * mm, 145 * mm], repeatRows=1)
         table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")), ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#c6d2dc")), ("FONTNAME", (0, 0), (-1, -1), font), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6)]))
         story.append(table)

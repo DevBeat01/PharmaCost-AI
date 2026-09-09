@@ -1,14 +1,25 @@
 import os
-# 【必须放在最顶部！！！】镜像环境变量，放后面就失效
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-from sentence_transformers import SentenceTransformer
+import torch
+import torch.nn as nn
 
-print("开始加载&下载 all‑MiniLM‑L6‑v2 ...")
-# 从镜像下载
-model = SentenceTransformer('all-MiniLM-L6-v2')
-print("✅ 模型下载完成，开始保存到本地磁盘")
+def dm_rnn_for_base():
+  # 1.创建GRU模型对象
+  gru = nn.GRU(5,6,1)
+  # 2.创建输入数据
+  input = torch.randn(2,3,5)
+  # 3.创建初始隐藏状态
+  h0 = torch.randn(1,3,6)
+  
+  # 4.运行GRU模型
+  output, h = gru(input, h0)
+  
+  # 5.打印输出结果
+  print(output)
 
-save_path = r"D:\ai_model\all-MiniLM-L6-v2"
-model.save(save_path)
-print(f"✅ 文件已经保存成功！路径：{save_path}")
+
+if __name__ == '__main__':
+  dm_rnn_for_base()
+
+
