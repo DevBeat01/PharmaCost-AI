@@ -58,6 +58,8 @@ if errorlevel 1 (
     echo.
 )
 
+if not defined RPA_BASE_URL set "RPA_BASE_URL=http://127.0.0.1:8090"
+
 REM --- 启动主应用 ---
 echo [启动] 主应用 uvicorn on http://127.0.0.1:8000
 echo [启动] 知识库构建在后台异步运行（首次启动需下载模型约80MB）

@@ -13,7 +13,9 @@ const DashboardPage = {
     _currentAlerts: [],
     _taskGenerationContext: null,
     // v2 用于淘汰旧版本因超时产生的预设兜底文本缓存。
-    _attributionStoragePrefix: 'pharmacost.dashboard.attribution.v2:',
+    // Bump when the server-side chapter normalization changes so stale
+    // summaries cannot mask the current evidence-led attribution layout.
+    _attributionStoragePrefix: 'pharmacost.dashboard.attribution.v3:',
     _heatmapResizeObserver: null,
     _forecastRequestId: 0,
 
@@ -247,8 +249,11 @@ const DashboardPage = {
                 evidence: attributionCache.taskEvidence || { alerts: attributionCache.alerts || [] },
             });
         }
-        // 归因接口与看板数据并行请求，不再等待三维表完成后才启动。
-        void this.loadAttribution(product, month, [], version, attributionRequestId);
+        // 已有当前产品/月的归因缓存时直接复用，避免页面切换或刷新再次
+        // 发起 SSE/AI 请求；点击“重新分析”会主动清理缓存并 force=true。
+        if (!attributionCache) {
+            void this.loadAttribution(product, month, [], version, attributionRequestId);
+        }
         this.loadThreeDim(product, month, version);   // 三维表 + 指标卡片
         this.loadTrend(product, version);
         this.loadForecast(product, version);
@@ -327,12 +332,20 @@ const DashboardPage = {
             let finalData = null;
             await Utils.streamSse(`/api/dashboard/attribution/stream?${Utils.qs({ product, month, force: force ? 'true' : undefined })}`, {
                 signal: this._attributionController && this._attributionController.signal,
-                timeoutMs: 90000,
+                // Compatible providers can need a long prefill before their
+                // first delta for a full cost-dashboard context.
+                timeoutMs: 120000,
                 onEvent: (eventName, payload) => {
                     if (!this.isAttributionCurrent(version, requestId)) return;
                     if (eventName === 'meta') {
                         this._currentAlerts = payload.alerts || alerts;
                         this.renderAlerts(this._currentAlerts);
+                    } else if (eventName === 'replace') {
+                        accumulated = String(payload.text || '');
+                        const full = document.getElementById('attributionText');
+                        const details = document.getElementById('attributionDetails');
+                        if (full) full.innerHTML = this.markdownToHtml(accumulated);
+                        if (details) { details.style.display = ''; details.open = true; }
                     } else if (eventName === 'chunk') {
                         accumulated += String(payload.text || '');
                         const full = document.getElementById('attributionText');
@@ -354,7 +367,9 @@ const DashboardPage = {
                 ragSources: data.rag_sources || [],
                 taskEvidence: this.buildTaskEvidence(data),
             };
-            if (result.source !== 'fallback') this._setAttributionCache(cacheKey, result);
+            // Incomplete streamed text is useful to show once, but must not
+            // become the cached result for a later page visit.
+            if (result.source === 'ai') this._setAttributionCache(cacheKey, result);
             this._attributionRenderedVersion = version;
             this.renderAlerts(result.alerts);
             this.renderAttribution(result.analysis, result.important, result.ragSources);
@@ -363,6 +378,23 @@ const DashboardPage = {
         } catch (e) {
             if (e.name === 'AbortError') return;
             if (!this.isAttributionCurrent(version, requestId)) return;
+            // If the connection ends after useful model deltas arrived, keep
+            // that text visible instead of replacing it with a short generic
+            // fallback. It is intentionally not cached as a completed result.
+            if (accumulated.trim()) {
+                const partial = {
+                    analysis: accumulated.trim(),
+                    alerts: this._currentAlerts || alerts,
+                    important: Boolean((this._currentAlerts || alerts).length),
+                    source: 'ai_partial',
+                    ragSources: [],
+                };
+                this._attributionRenderedVersion = version;
+                this.renderAttribution(partial.analysis, partial.important, partial.ragSources);
+                this.setTaskGenerationContext({ product, month, conclusion: partial.analysis, evidence: { alerts: partial.alerts } });
+                console.warn('[Dashboard] 归因流中断，保留已生成内容', e);
+                return;
+            }
             const result = {
                 analysis: alerts.length ? '## 重点分析\n\n重点波动已告警，请结合采购价格、单耗和生产工艺参数进一步核查。' : this.regularAttribution(product, month),
                 alerts,
@@ -530,6 +562,20 @@ const DashboardPage = {
         }
     },
 
+    clearAttributionCache() {
+        this._attributionCache.clear();
+        try {
+            const keys = [];
+            for (let index = 0; index < sessionStorage.length; index += 1) {
+                const key = sessionStorage.key(index);
+                if (key && key.startsWith(this._attributionStoragePrefix)) keys.push(key);
+            }
+            keys.forEach(key => sessionStorage.removeItem(key));
+        } catch (e) {
+            // sessionStorage may be unavailable; in-memory cache is still cleared.
+        }
+    },
+
     regularAttribution(product, month, data) {
         const rows = (data && data.rows) || [];
         const unit = rows.find(row => String(row.metric || '').includes('单位成本')) || {};
@@ -564,9 +610,13 @@ const DashboardPage = {
         const out = [];
         let list = null;
         const inline = value => {
-            let html = Utils.escapeHtml(value);
+            const normalizedValue = String(value ?? '').replace(/＊＊/g, '**');
+            let html = Utils.escapeHtml(normalizedValue);
+            // Models occasionally emit HTML or full-width asterisks for
+            // emphasis; normalize those forms to the same safe <strong> UI.
             html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-            html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
+            html = html.replace(/__([^_]+?)__/g, '<strong>$1</strong>');
+            html = html.replace(/&lt;(?:strong|b)&gt;(.+?)&lt;\/(?:strong|b)&gt;/gi, '<strong>$1</strong>');
             html = html.replace(/`(.+?)`/g, '<code>$1</code>');
             return html;
         };

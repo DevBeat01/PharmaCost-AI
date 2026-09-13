@@ -1,5 +1,6 @@
 """RPA整改任务生成、勾选派发与消息推送回归测试。"""
 import asyncio
+import httpx
 import sys
 import tempfile
 from pathlib import Path
@@ -129,6 +130,18 @@ def test_vague_ai_tasks_are_rejected_and_replaced_with_executable_drafts():
     assert result["tasks"]
     assert all(client._is_executable_task(task) for task in result["tasks"])
     assert all(task["assignee"]["department"] and task["assignee"]["role"] for task in result["tasks"])
+    assert all(task["expected_result"] for task in result["tasks"])
+    assert all(client._TASK_RESULT_RE.search(task["expected_result"]) for task in result["tasks"])
+
+
+def test_task_without_llm_deliverable_gets_a_verifiable_expected_result():
+    generated, rejected = client._filter_executable_tasks([
+        {"task_title": "复核金银花采购入库价与合同单价差异"},
+    ], "2026-06")
+    assert rejected == 0
+    assert len(generated) == 1
+    assert "差异核查表" in generated[0]["expected_result"]
+    assert client._is_executable_task(generated[0])
 
 
 def test_only_selected_draft_is_dispatched_without_wechat_notification():
@@ -150,6 +163,69 @@ def test_only_selected_draft_is_dispatched_without_wechat_notification():
     result = with_temporary_store(run_dispatch)
     assert result["tasks_dispatched"] == 1
     assert result["results"][0]["status"] == "sent"
+
+
+def test_rpa_unavailable_keeps_task_as_draft_for_retry():
+    task = client._make_task_draft(
+        "银黄口服液", "2026-06",
+        {"task_title": "核查金银花采购入库价", "assignee": {"name": "张伟", "department": "采购部"}},
+        "成本看板归因分析", "材料成本异常",
+    )
+
+    def run_dispatch(_):
+        client.TASK_STORE.upsert(task)
+        with patch.object(client, "send_rpa_task", new_callable=AsyncMock,
+                          side_effect=httpx.ConnectError("RPA offline")):
+            result = asyncio.run(client.dispatch_selected_tasks([task["task_id"]]))
+            return result, client.TASK_STORE.get(task["task_id"])
+
+    result, stored = with_temporary_store(run_dispatch)
+    assert result["tasks_dispatched"] == 0
+    assert result["results"][0]["retryable"] is True
+    assert stored["status"] == "draft"
+    assert stored["notification_status"] == "not_sent"
+
+
+def test_any_rpa_dispatch_error_returns_task_to_pending_queue():
+    task = client._make_task_draft(
+        "银黄口服液", "2026-06",
+        {"task_title": "复核采购入库价", "assignee": {"name": "张伟", "department": "采购部"}},
+        "成本看板归因分析", "材料成本异常",
+    )
+
+    def run_dispatch(_):
+        client.TASK_STORE.upsert(task)
+        with patch.object(client, "send_rpa_task", new_callable=AsyncMock,
+                          side_effect=RuntimeError("RPA返回异常")):
+            result = asyncio.run(client.dispatch_selected_tasks([task["task_id"]]))
+        restored = client.TASK_STORE.get(task["task_id"])
+        return result, restored
+
+    result, restored = with_temporary_store(run_dispatch)
+    assert result["results"][0]["status"] == "draft"
+    assert result["results"][0]["retryable"] is True
+    assert "待派发" in result["results"][0]["error"]
+    assert restored["status"] == "draft"
+
+
+def test_legacy_failed_dispatch_is_migrated_to_draft_on_list():
+    task = client._make_task_draft(
+        "银黄口服液", "2026-06", {"task_title": "历史失败任务"},
+        "成本看板归因分析", "材料成本异常",
+    )
+    task["status"] = "failed"
+    task["notification_status"] = "failed"
+
+    def run_list(_):
+        client.TASK_STORE.upsert(task)
+        result = asyncio.run(client.list_rpa_tasks(status="failed"))
+        return result, client.TASK_STORE.get(task["task_id"])
+
+    result, restored = with_temporary_store(run_list)
+    assert result["total"] == 1
+    assert result["tasks"][0]["status"] == "draft"
+    assert restored["status"] == "draft"
+    assert restored["notification_status"] == "not_sent"
 
 
 def test_selected_rpa_task_can_be_notified_later():

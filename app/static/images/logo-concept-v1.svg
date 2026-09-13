@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">PharmaCost AI concept logo</title>
+  <desc id="desc">A blue pharmaceutical capsule enclosed by an analytical data ring.</desc>
+  <defs>
+    <linearGradient id="ring" x1="26" y1="25" x2="225" y2="229" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B59F8"/>
+      <stop offset="1" stop-color="#16B8A6"/>
+    </linearGradient>
+    <linearGradient id="capsule" x1="90" y1="75" x2="169" y2="181" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B59F8"/>
+      <stop offset="1" stop-color="#0F43C7"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="7" stdDeviation="7" flood-color="#173A8F" flood-opacity=".18"/>
+    </filter>
+  </defs>
+
+  <circle cx="128" cy="128" r="103" fill="#F5F8FF"/>
+  <path d="M128 25a103 103 0 0 1 94 61" fill="none" stroke="url(#ring)" stroke-width="12" stroke-linecap="round"/>
+  <path d="M222 158a103 103 0 0 1-67 66" fill="none" stroke="url(#ring)" stroke-width="12" stroke-linecap="round"/>
+  <path d="M86 220a103 103 0 0 1-65-76" fill="none" stroke="#B8C9F8" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="128" cy="25" r="6" fill="#16B8A6"/>
+  <circle cx="222" cy="158" r="6" fill="#1B59F8"/>
+
+  <g filter="url(#shadow)">
+    <rect x="91" y="65" width="74" height="126" rx="37" fill="url(#capsule)" transform="rotate(38 128 128)"/>
+    <path d="M104 105h74v35h-74z" fill="#16B8A6" opacity=".95" transform="rotate(38 128 128)"/>
+    <path d="M128 83v90" stroke="#FFFFFF" stroke-opacity=".25" stroke-width="3" transform="rotate(38 128 128)"/>
+  </g>
+
+  <path d="M72 179l20-17 17 8 25-30 20 14 30-36" fill="none" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="72" cy="179" r="5" fill="#FFFFFF"/>
+  <circle cx="92" cy="162" r="5" fill="#FFFFFF"/>
+  <circle cx="109" cy="170" r="5" fill="#FFFFFF"/>
+  <circle cx="134" cy="140" r="5" fill="#FFFFFF"/>
+  <circle cx="154" cy="154" r="5" fill="#FFFFFF"/>
+  <circle cx="184" cy="118" r="5" fill="#FFFFFF"/>
+</svg>

@@ -9,6 +9,7 @@ services:
       - app/.env
     environment:
       DATA_DIR: /data
+      RPA_BASE_URL: http://rpa:8090
     depends_on:
       - rpa
     restart: unless-stopped

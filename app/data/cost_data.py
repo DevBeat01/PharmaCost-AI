@@ -5,9 +5,7 @@ from typing import Optional
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import (
-    PRODUCTS, MONTHS, get_data_file
-)
+from config import PRODUCT_SPECS, get_data_file
 
 
 class CostDataService:
@@ -25,6 +23,8 @@ class CostDataService:
         self.bench_2025: pd.DataFrame = pd.DataFrame()
         self.market: pd.DataFrame = pd.DataFrame()
         self.industry: pd.DataFrame = pd.DataFrame()
+        self.products: list[str] = []
+        self.months: list[str] = []
 
     def load_all(self):
         """加载所有CSV数据"""
@@ -45,6 +45,7 @@ class CostDataService:
         self.bench_2025 = self._load(get_data_file("benchmark_2025"))
         self.market = self._load(get_data_file("market"))
         self.industry = self._load(get_data_file("industry"))
+        self._refresh_dimensions()
         self._loaded = True
         print(f"数据加载完成: 10个CSV文件已就绪")
 
@@ -58,16 +59,50 @@ class CostDataService:
         if not self._loaded:
             raise RuntimeError("数据尚未加载，请先调用 load_all()")
 
+    def _refresh_dimensions(self) -> None:
+        """Derive selector dimensions from the currently loaded data."""
+        # The current-year cost summary is the authoritative source for the
+        # selectors: detail/benchmark files can legitimately contain stale or
+        # supplemental rows that do not have a corresponding dashboard row.
+        products: set[str] = set()
+        if '产品名称' in self.cost_2026.columns:
+            products.update(self.cost_2026['产品名称'].dropna().astype(str).str.strip())
+        if not products:
+            # Keep the service usable for partially provisioned data bundles.
+            frames = [self.cost_2025, self.material, self.overhead, self.budget,
+                      self.labor, self.bench_2026, self.bench_2025]
+            for frame in frames:
+                if '产品名称' in frame.columns:
+                    products.update(frame['产品名称'].dropna().astype(str).str.strip())
+        self.products = sorted(p for p in products if p)
+        values = []
+        if '月份' in self.cost_2026.columns:
+            values = self.cost_2026['月份'].dropna().astype(str).str.strip().unique().tolist()
+        self.months = sorted((m for m in values if m), key=self._month_sort_key)
+
+    @staticmethod
+    def _month_sort_key(month: str) -> tuple[int, int, str]:
+        try:
+            year, number = str(month).split('-', 1)
+            return int(year), int(number), str(month)
+        except (ValueError, AttributeError):
+            return 0, 0, str(month)
+
+    def _previous_month(self, month: str) -> str | None:
+        if month not in self.months:
+            return None
+        index = self.months.index(month)
+        return self.months[index - 1] if index > 0 else None
+
     # ==================== 产品列表 ====================
 
     def get_products(self) -> list[dict]:
         """获取产品列表"""
-        specs = {"银黄口服液": "10ml×10支/盒", "板蓝根颗粒": "10g×20袋/盒", "六味地黄胶囊": "0.3g×60粒/盒"}
-        return [{"name": p, "spec": specs[p]} for p in PRODUCTS]
+        return [{"name": p, "spec": PRODUCT_SPECS.get(p, "")} for p in self.products]
 
     def get_months(self) -> list[str]:
         """获取可用月份"""
-        return MONTHS
+        return list(self.months)
 
     # ==================== 成本汇总查询 ====================
 
@@ -91,17 +126,19 @@ class CostDataService:
 
     def get_cost_summary_prev_month(self, product: str, month: str) -> Optional[dict]:
         """获取上月成本汇总"""
-        if not month or month not in MONTHS:
+        previous_month = self._previous_month(month)
+        if not previous_month:
             return None
-        idx = MONTHS.index(month)
-        if idx <= 0:
-            return None
-        return self.get_cost_summary(product, MONTHS[idx - 1])
+        return self.get_cost_summary(product, previous_month)
 
     def get_cost_summary_last_year(self, product: str, month: str) -> Optional[dict]:
         """获取去年同月成本汇总"""
         self._check_loaded()
-        last_year_month = month.replace("2026", "2025")
+        try:
+            year, month_number = str(month).split('-', 1)
+            last_year_month = f"{int(year) - 1:04d}-{month_number}"
+        except (ValueError, TypeError):
+            return None
         row = self.cost_2025[
             (self.cost_2025['产品名称'] == product) &
             (self.cost_2025['月份'] == last_year_month) &
@@ -160,12 +197,10 @@ class CostDataService:
 
     def get_material_detail_prev(self, product: str, month: str) -> dict[str, float]:
         """获取上月原材料单位成本（用于环比计算）"""
-        if not month or month not in MONTHS:
+        previous_month = self._previous_month(month)
+        if not previous_month:
             return {}
-        idx = MONTHS.index(month)
-        if idx <= 0:
-            return {}
-        prev = self.get_material_detail(product, MONTHS[idx - 1])
+        prev = self.get_material_detail(product, previous_month)
         return {m['material_name']: m['unit_cost'] for m in prev}
 
     # ==================== 制造费用明细 ====================
@@ -187,12 +222,10 @@ class CostDataService:
 
     def get_overhead_detail_prev(self, product: str, month: str) -> dict[str, float]:
         """获取上月制造费用（用于环比计算）"""
-        if not month or month not in MONTHS:
+        previous_month = self._previous_month(month)
+        if not previous_month:
             return {}
-        idx = MONTHS.index(month)
-        if idx <= 0:
-            return {}
-        prev = self.get_overhead_detail(product, MONTHS[idx - 1])
+        prev = self.get_overhead_detail(product, previous_month)
         return {o['category']: o['unit_cost'] for o in prev}
 
     # ==================== 人工工时明细 ====================
@@ -216,12 +249,10 @@ class CostDataService:
 
     def get_labor_detail_prev(self, product: str, month: str) -> Optional[dict]:
         """获取上月人工工时"""
-        if not month or month not in MONTHS:
+        previous_month = self._previous_month(month)
+        if not previous_month:
             return None
-        idx = MONTHS.index(month)
-        if idx <= 0:
-            return None
-        return self.get_labor_detail(product, MONTHS[idx - 1])
+        return self.get_labor_detail(product, previous_month)
 
     # ==================== 预算数据 ====================
 

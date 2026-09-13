@@ -17,7 +17,7 @@ logger = logging.getLogger("benchmark")
 _ATTRIBUTION_CACHE_PATH = Path(__file__).resolve().parent.parent / "output" / "benchmark_attribution_cache.json"
 _ATTRIBUTION_CACHE_LOCK = threading.Lock()
 # 归因格式规范化逻辑变更后，旧缓存需要重新生成。
-_ATTRIBUTION_CACHE_VERSION = 5
+_ATTRIBUTION_CACHE_VERSION = 6
 
 
 def _attribution_cache_key(product: str, month: str) -> str:
@@ -93,6 +93,31 @@ def _ensure_data_only_notice(text: str, rag_sources: list[str] | None) -> str:
         return text
     marker = "本结论仅基于成本数据"
     return text if marker in text else f"{text.rstrip()}\n\n注：{marker}。"
+
+
+def _append_rag_evidence(text: str, rag_results: list[dict] | None) -> str:
+    """Attach retrieved evidence snippets to the attribution with file citations."""
+    results = rag_results or []
+    if not results:
+        return str(text)
+    existing_source = re.search(r"(?m)^\s*(?:#{1,6}\s*)?知识库(?:依据|来源)\s*[:：]?\s*$", str(text))
+    if existing_source and re.search(r"\[来源：[^\]]+\]", str(text)):
+        return str(text)
+    lines = []
+    seen = set()
+    for result in results:
+        source = str(result.get("source") or "知识库").strip()
+        content = re.sub(r"\s+", " ", str(result.get("content") or "")).strip()
+        if not content or (source, content) in seen:
+            continue
+        seen.add((source, content))
+        lines.append(f"- [来源：{source}] {content[:300]}")
+    if not lines:
+        return str(text)
+    evidence_text = "\n".join(lines)
+    if existing_source:
+        return f"{str(text).rstrip()}\n{evidence_text}"
+    return f"{str(text).rstrip()}\n\n知识库依据：\n{evidence_text}"
 
 
 def _default_suggestions(product: str, month: str, diff_data: dict) -> list[dict]:
@@ -459,7 +484,7 @@ async def benchmark_attribution(product: str, month: str, force: bool = False) -
 
     suggestions = _extract_suggestions(attribution, product, month, diff_data)
     rag_sources = source_names(rag_results)
-    attribution = _ensure_data_only_notice(attribution, rag_sources)
+    attribution = _append_rag_evidence(attribution, rag_results) if rag_sources else _ensure_data_only_notice(attribution, rag_sources)
     _cache_attribution(product, month, attribution, suggestions, rag_sources, source)
     return {
         'product': product,
@@ -553,6 +578,6 @@ def benchmark_attribution_stream(product: str, month: str, force: bool = False):
         attribution = _build_attribution_fallback(diff_data)
         source = 'fallback'
     suggestions = _extract_suggestions(attribution, product, month, diff_data)
-    attribution = _ensure_data_only_notice(attribution, rag_sources)
+    attribution = _append_rag_evidence(attribution, rag_results) if rag_sources else _ensure_data_only_notice(attribution, rag_sources)
     _cache_attribution(product, month, attribution, suggestions, rag_sources, source)
     yield {'event': 'complete', 'data': result_payload(attribution, suggestions, rag_sources, source, False)}

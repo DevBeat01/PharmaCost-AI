@@ -37,6 +37,7 @@ _TASK_OBJECT_RE = re.compile(
     r"设备|能耗|维修|费用分摊|分摊表|成本明细|会计凭证|费用科目|产量|工艺参数|运行记录)"
 )
 _TASK_VAGUE_RE = re.compile(r"(加强管理|持续关注|密切关注|提高意识|优化成本|降本增效|提升能力|协同推进|做好.*工作)")
+_TASK_RESULT_RE = re.compile(r"(差异核查表|核查表|复核记录|确认记录|改善方案|整改措施|汇总表|对比表|签字记录)")
 
 # 任务草稿与派发状态持久化到 SQLite，应用重启后仍可继续处理。
 TASK_STORE = TaskStore(RPA_TASK_DB_PATH)
@@ -81,24 +82,59 @@ def _valid_deadline(value: object, month: str) -> str:
 
 
 def _is_executable_task(item: dict) -> bool:
-    """判断任务是否具备动作和可复核对象，拒绝不可直接执行的口号式任务。"""
+    """判断任务是否具备动作、对象和可验收交付物。"""
     if not isinstance(item, dict):
         return False
     title = re.sub(r"\s+", "", str(item.get("task_title") or ""))
     if len(title) < 8 or _TASK_VAGUE_RE.search(title):
         return False
-    return bool(_TASK_ACTION_RE.search(title) and _TASK_OBJECT_RE.search(title))
+    expected_result = re.sub(r"\s+", "", str(item.get("expected_result") or item.get("suggestion") or ""))
+    return bool(
+        _TASK_ACTION_RE.search(title)
+        and _TASK_OBJECT_RE.search(title)
+        and len(expected_result) >= 8
+        and not _TASK_VAGUE_RE.search(expected_result)
+        and _TASK_RESULT_RE.search(expected_result)
+    )
+
+
+def _default_expected_result(title: str) -> str:
+    """为模型遗漏交付物的任务补齐可审核的最小完成标准。"""
+    if any(word in title for word in ("采购", "合同", "供应商", "入库价", "原材料", "药材")):
+        return "输出采购入库价、合同单价及报价差异核查表，并提交整改措施。"
+    if any(word in title for word in ("人工", "工时", "排班", "人员", "效率", "单耗", "收率", "工艺")):
+        return "输出工时、单耗或收率复核记录，并提交改善方案。"
+    if any(word in title for word in ("设备", "能耗", "维修", "费用", "分摊", "产量")):
+        return "输出费用明细与分摊差异核查表，并提交整改措施。"
+    return "输出成本明细核查表，并提交经责任部门确认的整改措施。"
+
+
+def _normalize_task_instruction(item: dict) -> dict:
+    """统一任务标题和验收交付物，确保草稿可直接执行和验收。"""
+    normalized = dict(item or {})
+    title = re.sub(r"\s+", " ", str(normalized.get("task_title") or "")).strip().rstrip("。；")
+    # Keep the dispatch card scannable even when the model echoes the whole
+    # attribution paragraph instead of a concise task title.
+    normalized["task_title"] = title[:120]
+    expected_result = re.sub(r"\s+", " ", str(
+        normalized.get("expected_result") or normalized.get("suggestion") or ""
+    )).strip().rstrip("。；")
+    if not _TASK_RESULT_RE.search(expected_result) or _TASK_VAGUE_RE.search(expected_result):
+        expected_result = _default_expected_result(normalized["task_title"])
+    normalized["expected_result"] = expected_result[:200]
+    # suggestion 是既有 RPA 协议字段，继续使用它携带验收交付物。
+    normalized["suggestion"] = expected_result
+    return normalized
 
 
 def _filter_executable_tasks(items: list[dict], month: str) -> tuple[list[dict], int]:
     """清理模型输出，并将截止日规范为可执行的近期日期。"""
     accepted, seen, rejected = [], set(), 0
     for item in items:
-        if not _is_executable_task(item):
+        normalized = _normalize_task_instruction(item)
+        if not _is_executable_task(normalized):
             rejected += 1
             continue
-        normalized = dict(item)
-        normalized["task_title"] = re.sub(r"\s+", " ", str(item["task_title"])).strip().rstrip("。；")
         key = re.sub(r"\s+", "", normalized["task_title"])
         if key in seen:
             continue
@@ -268,6 +304,7 @@ def _benchmark_suggestion_tasks(product: str, month: str, scenario: str, conclus
             "deadline": item.get("deadline") or _deadline_for_month(month),
             "suggestion": suggestion,
         }
+        candidate = _normalize_task_instruction(candidate)
         if _is_executable_task(candidate):
             candidate["deadline"] = _valid_deadline(candidate["deadline"], month)
             tasks.append(candidate)
@@ -279,6 +316,7 @@ def _benchmark_suggestion_tasks(product: str, month: str, scenario: str, conclus
 def _make_task_draft(
     product: str, month: str, item: dict, scenario: str, conclusion: str, evidence: dict | None = None,
 ) -> dict:
+    item = _normalize_task_instruction(item)
     source = item.get("source") if isinstance(item.get("source"), dict) else {}
     source_text = " ".join(str(value) for value in source.values())
     assignee = item.get("assignee") if isinstance(item.get("assignee"), dict) else {}
@@ -301,6 +339,7 @@ def _make_task_draft(
         "priority": _normalize_priority(item.get("priority", "medium")),
         "deadline": _valid_deadline(item.get("deadline"), month),
         "suggestion": item.get("suggestion", ""),
+        "expected_result": item.get("expected_result", ""),
         "analysis_evidence": dict(evidence or {}),
         "rag_used": bool(evidence.get("rag_sources") or evidence.get("rag_used")) if isinstance(evidence, dict) else False,
         "rag_sources": list(evidence.get("rag_sources") or []) if isinstance(evidence, dict) else [],
@@ -371,6 +410,10 @@ async def save_selected_task_drafts(tasks: list[dict]) -> dict:
         conclusion = str(source.get("attribution_conclusion") or "").strip()
         if not product or not month or not conclusion or not item.get("task_title"):
             continue
+        item = _normalize_task_instruction(item)
+        if not _is_executable_task(item):
+            logger.warning("拒绝保存不可执行的整改任务: %s", item.get("task_title"))
+            continue
         draft = _make_task_draft(
             product, month, item, scenario, conclusion,
             item.get("analysis_evidence") if isinstance(item.get("analysis_evidence"), dict) else {},
@@ -402,6 +445,8 @@ def _rpa_payload(task: dict) -> dict:
 
 async def dispatch_selected_tasks(task_ids: list[str]) -> dict:
     """仅将前端勾选的草稿任务发送到RPA，不发送微信。"""
+    # 兼容旧版本留下的 failed 状态，允许直接重新派发。
+    _restore_failed_dispatch_tasks()
     results = []
     for task_id in dict.fromkeys(task_ids):
         task = TASK_STORE.get(task_id)
@@ -423,11 +468,17 @@ async def dispatch_selected_tasks(task_ids: list[str]) -> dict:
                 "rpa_status": "已发送至 RPA",
             })
         except Exception as exc:
-            logger.exception("RPA任务派发失败")
-            task["status"] = "failed"
-            task["notification_status"] = "failed"
+            # 派发未成功的任务一律回到待派发队列，方便用户修正后再次发送。
+            logger.warning("RPA任务派发未成功，任务保留待派发: %s", exc)
+            task["status"] = "draft"
+            task["notification_status"] = "not_sent"
             TASK_STORE.upsert(task)
-            results.append({"task_id": task_id, "status": "failed", "error": str(exc)})
+            results.append({
+                "task_id": task_id,
+                "status": "draft",
+                "error": "本次未发送成功，任务已恢复为待派发，请检查后重试",
+                "retryable": True,
+            })
 
     sent = sum(item["status"] == "sent" for item in results)
     return {"tasks_dispatched": sent, "tasks_failed": len(results) - sent, "results": results}
@@ -490,9 +541,21 @@ async def _refresh_task_statuses() -> None:
     await asyncio.gather(*(refresh_one(task) for task in sent_tasks))
 
 
+def _restore_failed_dispatch_tasks() -> None:
+    """将旧版本留下的派发失败状态迁移回可重试的待派发状态。"""
+    for task in TASK_STORE.list(status="failed"):
+        task["status"] = "draft"
+        task["notification_status"] = "not_sent"
+        TASK_STORE.upsert(task)
+
+
 async def list_rpa_tasks(**filters) -> dict:
     # 列表优先读取本地 SQLite，避免远端逐条状态查询导致页面超时。
     # 派发、通知和单条详情仍会同步保存最新状态。
+    # 兼容旧版本将派发异常写为 failed 的记录：恢复为待派发，支持再次发送。
+    _restore_failed_dispatch_tasks()
+    if filters.get("status") == "failed":
+        filters = {**filters, "status": "draft"}
     tasks = TASK_STORE.list(**filters)
     return {"total": len(tasks), "tasks": tasks}
 
@@ -503,6 +566,7 @@ async def get_rpa_task(task_id: str) -> dict:
 
 
 async def get_rpa_stats() -> dict:
+    _restore_failed_dispatch_tasks()
     tasks = TASK_STORE.list()
     counts = Counter(task["status"] for task in tasks)
     total = len(tasks)

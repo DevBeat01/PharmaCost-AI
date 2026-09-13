@@ -89,6 +89,22 @@ class ResourceManager:
                 (resource_type, logical_key, digest),
             ).fetchone()
             if row:
+                # Content-addressed uploads reuse the version, but the latest
+                # import name/validation metadata must still be reflected in
+                # the settings UI.
+                try:
+                    existing_metadata = json.loads(row["metadata_json"] or "{}")
+                except json.JSONDecodeError:
+                    existing_metadata = {}
+                existing_metadata.update(metadata or {})
+                existing_metadata.setdefault("original_filename", Path(filename).name)
+                conn.execute(
+                    "UPDATE resource_versions SET filename=?, metadata_json=? WHERE resource_id=?",
+                    (Path(filename).name, json.dumps(existing_metadata, ensure_ascii=False), row["resource_id"]),
+                )
+                row = conn.execute(
+                    "SELECT * FROM resource_versions WHERE resource_id=?", (row["resource_id"],)
+                ).fetchone()
                 return self._row_to_dict(row)
             next_version = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) + 1 AS next_version "

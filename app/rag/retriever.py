@@ -20,6 +20,7 @@ _bm25 = None
 _bm25_corpus = []
 _bm25_metadata = []
 _BM25_CACHE_PATH = Path(__file__).resolve().parent / "bm25_index_cache.json"
+_BM25_CACHE_LOADED = False
 
 
 def _documents_fingerprint(documents: list[dict]) -> str:
@@ -29,7 +30,7 @@ def _documents_fingerprint(documents: list[dict]) -> str:
 
 def build_bm25_index(documents: list[dict]):
     """构建BM25索引"""
-    global _bm25, _bm25_corpus, _bm25_metadata
+    global _bm25, _bm25_corpus, _bm25_metadata, _BM25_CACHE_LOADED
     fingerprint = _documents_fingerprint(documents)
     try:
         cached = json.loads(_BM25_CACHE_PATH.read_text(encoding='utf-8'))
@@ -37,6 +38,7 @@ def build_bm25_index(documents: list[dict]):
             _bm25_corpus = cached.get('corpus', [])
             _bm25_metadata = cached.get('metadata', [])
             _bm25 = BM25Okapi(_bm25_corpus) if _bm25_corpus else None
+            _BM25_CACHE_LOADED = True
             logger.info("复用本地 BM25 索引: %s 个片段", len(_bm25_corpus))
             return
     except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
@@ -62,10 +64,36 @@ def build_bm25_index(documents: list[dict]):
         }, ensure_ascii=False), encoding='utf-8')
     except OSError:
         logger.warning("BM25索引缓存写入失败", exc_info=True)
+    _BM25_CACHE_LOADED = True
+
+
+def _load_bm25_cache_if_needed() -> None:
+    """Load the last complete keyword index while the vector index rebuilds.
+
+    Startup builds the knowledge base in a daemon thread. Attribution requests
+    can arrive during that window, so retrieval must not wait for PDF parsing or
+    the embedding model when a valid BM25 cache already exists.
+    """
+    global _bm25, _bm25_corpus, _bm25_metadata, _BM25_CACHE_LOADED
+    if _BM25_CACHE_LOADED or _bm25 is not None:
+        return
+    try:
+        cached = json.loads(_BM25_CACHE_PATH.read_text(encoding='utf-8'))
+        corpus = cached.get('corpus', [])
+        metadata = cached.get('metadata', [])
+        if corpus and metadata:
+            _bm25_corpus = corpus
+            _bm25_metadata = metadata
+            _bm25 = BM25Okapi(_bm25_corpus)
+            _BM25_CACHE_LOADED = True
+            logger.info("归因请求复用本地 BM25 索引: %s 个片段", len(_bm25_corpus))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return
 
 
 def bm25_search(query: str, top_k: int = 5) -> list[dict]:
     """BM25关键词检索"""
+    _load_bm25_cache_if_needed()
     if _bm25 is None or not _bm25_corpus:
         return []
     tokens = list(jieba.cut(query))

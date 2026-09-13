@@ -139,6 +139,17 @@ class LLMClient:
                 pass
         self.__init__()
 
+    @staticmethod
+    def _completion_options(model: str) -> dict:
+        """Provider-specific options that keep report generation responsive."""
+        # Qwen3 enables a lengthy reasoning pass for some compatible-endpoint
+        # deployments. Dashboard attribution needs direct report prose, not
+        # hidden chain-of-thought, otherwise the first visible token can take
+        # longer than the SSE window.
+        if str(model or "").lower().startswith("qwen3"):
+            return {"extra_body": {"enable_thinking": False}}
+        return {}
+
     def _chat_once(self, messages, max_tokens):
         if not self._providers:
             raise RuntimeError("未配置 DeepSeek 或 MiMo API 密钥")
@@ -148,6 +159,7 @@ class LLMClient:
                 response = client.chat.completions.create(
                     model=model, messages=messages,
                     max_tokens=max_tokens, temperature=0.3,
+                    **self._completion_options(model),
                 )
                 content = response.choices[0].message.content
                 if not str(content or "").strip():
@@ -244,9 +256,16 @@ class LLMClient:
                 stream = client.chat.completions.create(
                     model=model, messages=messages, max_tokens=max_tokens,
                     temperature=0.3, stream=True,
+                    **self._completion_options(model),
                 )
                 for chunk in stream:
-                    content = chunk.choices[0].delta.content
+                    # OpenAI-compatible providers may emit keep-alive or
+                    # usage-only chunks without choices/content.
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    content = getattr(delta, "content", None) if delta else None
                     if content:
                         yielded = True
                         yield content

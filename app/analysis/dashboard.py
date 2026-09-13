@@ -11,13 +11,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.cost_data import cost_service
-from config import ALERT_THRESHOLD, MONTHS, PRODUCTS
+from config import ALERT_THRESHOLD
 
 logger = logging.getLogger("analysis.dashboard")
 
 _RAG_TIMEOUT_SECONDS = 4.0
-# 首次模型加载及网络首包可能较慢；前端 SSE 超时同为 90 秒，服务端不应提前中断。
-_LLM_STREAM_TIMEOUT_SECONDS = 90.0
+# Some OpenAI-compatible models take over 45 seconds to produce the first
+# token for the large dashboard context. Keep the server below the browser's
+# 120-second SSE deadline, while retaining a finite failure boundary.
+_LLM_STREAM_TIMEOUT_SECONDS = 100.0
+# Keep enough room for the summary, multi-driver focus analysis and actionable
+# recommendations in one response. The frontend renders the stream while it
+# arrives, so a larger cap does not delay the first visible text.
+_ATTRIBUTION_MAX_TOKENS = 4000
 _FOCUS_METRIC_NAMES = ("单位成本", "总成本", "直接材料", "直接人工", "制造费用")
 
 # 归因结果按产品和月份缓存，避免同一看板参数重复调用模型。
@@ -41,67 +47,228 @@ def _focus_alerts(data: dict) -> list[dict]:
 
 
 def _focus_analysis_section(data: dict, waterfall: dict, material: dict) -> str:
-    """Build a data-backed section that is present whenever a cost alert fires."""
+    """Build a non-repetitive, evidence-led focus analysis."""
     alerts = _focus_alerts(data)
     if not alerts:
         return ''
-
     rows = {row.get('metric'): row for row in data.get('rows', [])}
+    factors = [item for item in waterfall.get('items', []) if not item.get('is_total')]
+    factors.sort(key=lambda item: abs(float(item.get('value') or 0)), reverse=True)
+    factor_map = {str(item.get('name', '')).replace('变动', ''): item for item in factors}
+    def row_for(name):
+        return rows.get(next((key for key in rows if str(key).startswith(name)), name), {})
+    def pct(value):
+        return f"{float(value):+.2f}%" if value is not None else "暂无"
+    def money(value):
+        return f"{float(value):.2f}"
+
+    production = rows.get('产量(盒)', {})
+    total = rows.get('总成本(元)', {})
+    unit = rows.get('单位成本(元/盒)', {})
     lines = ["## 重点分析"]
-    for alert in alerts:
-        metric = str(alert.get('metric') or '成本要素')
-        row = rows.get(metric, {})
-        change = float(alert.get('change') or 0)
-        direction = '上涨' if change > 0 else '下降'
-        current = row.get('current')
-        previous = row.get('last_month')
-        value_text = (
-            f"本月{float(current):.2f}，上月{float(previous):.2f}"
-            if current is not None and previous is not None else "本月与上月数据需进一步核对"
-        )
-        verification = "请核查对应明细、原始凭证及成本分摊口径。"
-        if '直接材料' in metric:
-            top_material = (material.get('materials') or [None])[0]
-            if top_material:
-                verification = (
-                    f"重点核查{top_material.get('material_name', '主要原材料')}的采购单价、领料单价和单位消耗；"
-                    "其余材料及工艺单耗也需进一步核查。"
-                )
-            else:
-                verification = "重点核查采购单价、领料单价、投料量和单位消耗。"
-        elif '直接人工' in metric:
-            verification = "重点核查工时、工资率、人员配置和产量摊薄情况。"
-        elif '制造费用' in metric:
-            verification = "重点核查能耗、维修、设备运行记录及费用分摊表。"
-        elif '总成本' in metric:
-            verification = "重点核查直接材料、直接人工、制造费用明细以及产量变化对总额的影响。"
+    overview = []
+    if unit.get('current') is not None:
+        overview.append(f"单位成本为{money(unit['current'])}元/盒，较上月{money(unit.get('last_month', 0))}元/盒变化{money(float(unit['current']) - float(unit.get('last_month') or 0))}元/盒（环比{pct(unit.get('mom_change'))}）")
+    if total.get('current') is not None and total.get('last_month') is not None:
+        overview.append(f"总成本由{float(total['last_month']):,.0f}元变为{float(total['current']):,.0f}元，变化{float(total['current']) - float(total['last_month']):+,.0f}元")
+    if production.get('current') is not None and production.get('last_month') is not None:
+        overview.append(f"产量{float(production['current']):,.0f}盒（上月{float(production['last_month']):,.0f}盒，{pct(production.get('mom_change'))}）")
+    lines.append("归因总览：" + "；".join(overview) + "。成本要素按对单位成本变动的贡献度排序，下面只写数据证据和对应待核查事项。")
+
+    # Each driver gets one focused paragraph; no generic repeated disclaimer.
+    for index, name in enumerate(("直接材料", "直接人工", "制造费用"), 1):
+        row = row_for(name)
+        item = factor_map.get(name, {})
+        if not row and not item:
+            continue
+        contribution = item.get('contribution_pct')
+        fact = f"本月为{money(row.get('current', 0))}，上月为{money(row.get('last_month', 0))}，变动{float(row.get('current', 0)) - float(row.get('last_month') or 0):+.2f}元/盒（环比{pct(row.get('mom_change'))}）"
+        if contribution is not None:
+            fact += f"，贡献单位成本变动{float(contribution):.1f}%"
+        if row.get('budget') is not None:
+            fact += f"；预算{money(row['budget'])}元/盒，预算偏差{pct(row.get('budget_deviation'))}"
+        if name == '直接材料':
+            materials = material.get('materials') or []
+            top = materials[:3]
+            detail = '；'.join(f"{m.get('material_name')} {money(m.get('unit_cost', 0))}元/盒（环比{pct(m.get('mom_change'))}，占比{float(m.get('ratio', 0)):.1f}%）" for m in top)
+            evidence = f"明细中排名靠前的物料为：{detail}。" if detail else "当前没有可用的原材料明细。"
+            check = "待核查采购入库价、合同单价、领料单、采购价格和单位消耗，判断价格变动还是单耗/收率变动。"
+            action = "采购部会同生产部5个工作日内提交价格与单耗差异核查表及整改措施（附前三项物料明细）。"
+            contribution_label = f"贡献{float(contribution):.1f}%" if contribution is not None else "贡献度待核算"
+            judgment = f"材料是本次单位成本变化的首要驱动（{contribution_label}），明细显示主要物料同步变动；具体是采购价格还是单耗变化，需用批次记录验证。"
+        elif name == '直接人工':
+            try:
+                labor = labor_metrics(data.get('product', ''), data.get('month', ''))
+                raw = labor.get('raw') or {}
+                evidence = f"人工原始记录：产量{raw.get('production', '暂无')}盒、总工时{raw.get('total_hours', '暂无')}小时、生产人数{raw.get('worker_count', '暂无')}人、工作天数{raw.get('work_days', '暂无')}天。"
+            except Exception:
+                evidence = "人工工时明细暂不可用。"
+            check = "待核查工时、工资率、排班和人员配置，区分总工时变化与产量摊薄效应。"
+            action = "生产部5个工作日内提交工时利用率、工资率和排班复核记录及效率改善方案。"
+            judgment = "人工单位成本变动幅度较小，不能单独解释本次总成本波动；应重点判断工时、工资率和产量摊薄三者的贡献。"
         else:
-            verification = "重点核查直接材料、直接人工、制造费用明细及其成本分摊口径。"
-        lines.append(
-            f"- {metric}{value_text}，环比{direction}{abs(change):.2f}%，已超过±{ALERT_THRESHOLD:.0f}%阈值。{verification}"
-        )
+            try:
+                overheads = cost_service.get_overhead_detail(data.get('product', ''), data.get('month', ''))
+            except Exception:
+                overheads = []
+            top = sorted(overheads, key=lambda x: float(x.get('unit_cost', 0)), reverse=True)[:3]
+            detail = '；'.join(f"{o.get('category')} {money(o.get('unit_cost', 0))}元/盒" for o in top)
+            evidence = f"制造费用明细排名靠前项目：{detail}。" if detail else "当前没有可用的制造费用明细。"
+            check = "待核查能耗、维修、折旧、费用科目和分摊表，确认固定费用及产量规模效应。"
+            action = "设备部会同财务部5个工作日内提交能耗、维修和分摊差异表。"
+            judgment = "制造费用下降幅度低于产量降幅，提示固定费用分摊存在规模效应；能耗、维修或折旧的具体影响仍需明细验证。"
+        heading = next((key for key in rows if str(key).startswith(name)), name)
+        lines.append(f"### {index}. {heading}\n数据事实：{fact}。\n\n明细证据：{evidence}\n\n影响判断：{judgment}\n\n核查路径：{check}\n\n处置动作：{action}")
+
+    if total.get('current') is not None:
+        lines.append(f"### 总成本与产量影响\n总成本变化主要由产量从{float(production.get('last_month', 0)):,.0f}盒变为{float(production.get('current', 0)):,.0f}盒以及单位成本要素变动共同造成；不能将总成本下降直接等同于成本效率改善。财务部应将产量、单位成本和总成本按同一批次口径勾稽，形成一张总成本桥接表。")
     return '\n\n'.join(lines)
 
 
 def _ensure_focus_analysis(text: str, data: dict, waterfall: dict, material: dict) -> str:
-    """Guarantee a correct focus section even when the LLM omits or misformats it."""
+    """Normalize attribution into exactly: summary, analysis, suggestions, sources."""
+    value = str(text or '').replace('\r', '').strip()
+    chapter_names = r"结论摘要|总体结论|结论|重点分析|常规分析|差异分析|改进建议|建议|知识库依据|知识库来源"
+    heading_re = re.compile(
+        r"(?m)^\s*(?:(?:(?:#{1,6}\s*)|(?:(?:[一二三四五六七八九十百]+|\d+)[、.)．.]\s+))"
+        r"(?P<key>" + chapter_names + r")\s*(?:(?:[:：]\s*(?P<inline>.*))|(?:[（(](?P<paren>.*)[）)]))?\s*$|"
+        r"^\s*(" + chapter_names + r")\s*$|"
+        r"^\s*(知识库依据|知识库来源)\s*[:：]\s*$)"
+    )
+    sections = {}
+    matches = list(heading_re.finditer(value))
+    unstructured_body = value if not matches else ''
+    aliases = {'总体结论': '结论摘要', '结论': '结论摘要', '常规分析': '常规分析',
+               '差异分析': '重点分析', '建议': '改进建议', '知识库来源': '知识库依据'}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        raw_key = next((group for group in match.groups() if group), '')
+        key = aliases.get(raw_key, raw_key)
+        inline = (match.groupdict().get('inline') or '').strip()
+        body = value[match.end():end].strip()
+        if inline:
+            body = f"{inline}\n\n{body}".strip()
+        # Keep the first occurrence of each top-level chapter. A repeated
+        # chapter is model formatting noise and must not be shown twice.
+        sections.setdefault(key, body)
+
+    # Older prompts sometimes emitted this wrapper as a standalone heading.
+    # It is not a report chapter and only makes the analysis look duplicated.
+    for key in ('结论摘要', '重点分析', '常规分析', '改进建议', '知识库依据'):
+        if key in sections:
+            sections[key] = re.sub(r"(?m)^\s*数据核验与处置要点\s*$", "", sections[key]).strip()
+
+    summary = sections.get('结论摘要') or sections.get('总体结论') or sections.get('结论') or ''
+    suggestion = sections.get('改进建议') or sections.get('建议') or ''
+    source_body = _compact_source_body(sections.get('知识库依据', ''))
+    focus_model = sections.get('重点分析') or sections.get('常规分析') or sections.get('差异分析') or unstructured_body
     focus_section = _focus_analysis_section(data, waterfall, material)
-    if not focus_section:
-        return text
 
-    text = str(text or '').strip()
-    focus_heading = re.compile(r"(?m)^#{1,3}\s*重点分析\s*$")
-    suggestion_heading = re.compile(r"(?m)^#{1,3}\s*改进建议\s*$")
-    match = focus_heading.search(text)
-    if match:
-        next_heading = re.search(r"(?m)^#{1,3}\s+\S", text[match.end():])
-        end = match.end() + next_heading.start() if next_heading else len(text)
-        return f"{text[:match.start()].rstrip()}\n\n{focus_section}\n\n{text[end:].lstrip()}".strip()
+    if _focus_alerts(data) and focus_section:
+        # Keep the model's reasoning as the primary narrative. The rule-based
+        # section is appended only as a factual supplement when the model gave
+        # a short but meaningful explanation, and replaces pure filler only.
+        model_body = _clean_focus_model_body(focus_model)
+        if model_body and not _is_focus_placeholder(model_body):
+            analysis = model_body
+            if not _is_substantive_focus_model(model_body):
+                generated = re.sub(r"^##\s*重点分析\s*", "", focus_section, count=1).strip()
+                if generated and generated not in analysis:
+                    analysis += f"\n\n数据补充：\n{generated}"
+        else:
+            analysis = re.sub(r"^##\s*重点分析\s*", "", focus_section, count=1).strip()
+        analysis = analysis.strip()
+    else:
+        analysis = focus_model or "暂无成本要素波动分析。"
 
-    match = suggestion_heading.search(text)
-    if match:
-        return f"{text[:match.start()].rstrip()}\n\n{focus_section}\n\n{text[match.start():].lstrip()}".strip()
-    return f"{text}\n\n{focus_section}".strip()
+    if not summary:
+        summary = f"{data.get('product', '')} {data.get('month', '')}成本数据已完成分析。"
+    suggestion = _actionable_dashboard_suggestions(suggestion, data, waterfall)
+
+    output = ["## 结论摘要", summary, f"## {'重点分析' if _focus_alerts(data) else '常规分析'}", analysis, "## 改进建议", suggestion]
+    if source_body:
+        output.extend(["## 知识库依据", source_body])
+    return "\n\n".join(part for part in output if part).strip()
+
+
+def _clean_focus_model_body(value: str) -> str:
+    """Remove only structural noise while retaining the model's prose."""
+    body = str(value or '').strip()
+    body = re.sub(r"(?m)^\s*(?:#{1,6}\s*)?(?:重点分析|常规分析|差异分析)\s*[:：]?\s*$", "", body)
+    body = re.sub(r"(?m)^\s*数据核验与处置要点\s*$", "", body)
+    # A model occasionally echoes the next top-level chapter in the section
+    # body when it omits a blank line; do not let that duplicate suggestions or
+    # source evidence in the focus paragraph.
+    body = re.split(r"(?m)^\s*(?:#{1,6}\s*)?(?:改进建议|建议|知识库依据|知识库来源)\s*[:：]?\s*$", body, maxsplit=1)[0]
+    return body.strip()
+
+
+def _is_substantive_focus_model(body: str) -> bool:
+    """Detect detailed model reasoning instead of generic filler text."""
+    if len(body) < 180:
+        return False
+    quantitative = len(re.findall(r"\d+(?:[,.，]\d+)*(?:%|％|元|盒|小时|天|次|项)", body))
+    reasoning = len(re.findall(r"原因|由于|因此|表明|说明|驱动|贡献|结合|对比|可能|需进一步核查|建议|应当|应重点", body))
+    generic = len(re.findall(r"具体业务原因需|结合业务情况持续分析|仅基于成本数据|不能直接证明", body))
+    return quantitative >= 2 and reasoning >= 2 and generic < 4
+
+
+def _is_focus_placeholder(body: str) -> bool:
+    """识别没有实际归因内容的占位语，避免它覆盖规则分析。"""
+    normalized = re.sub(r"\s+", "", str(body or ""))
+    if not normalized:
+        return True
+    placeholders = (
+        "分析很简单", "暂无成本要素波动分析", "请结合业务情况持续分析",
+        "重点波动已告警，请进一步核查", "当前数据不足，无法分析",
+    )
+    return any(item in normalized for item in placeholders)
+
+
+def _actionable_dashboard_suggestions(raw: str, data: dict, waterfall: dict) -> str:
+    """Keep model advice visible and append executable details when needed."""
+    meaningful = [line.strip() for line in re.split(r"\n+", str(raw or "")) if line.strip()]
+    cleaned = re.sub(r"(?m)^\s*(?:#+\s*)?(?:\d+[.、]\s*)?改进建议\s*[:：]?\s*$", "", str(raw)).strip()
+    # Keep the model's wording whenever it contains any meaningful advice.
+    # Do not force the standard three-driver template just because an advice
+    # item omits an owner, deliverable, or deadline; those details belong to
+    # the model output and should not hide its actual recommendations.
+    if meaningful and not _is_suggestion_placeholder(cleaned):
+        return cleaned
+
+    return _build_dashboard_tasks(data, waterfall)
+
+
+def _is_suggestion_placeholder(value: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(value or ""))
+    normalized = re.sub(r"^(?:\d+[.、)）]|[-*])", "", normalized)
+    if not normalized:
+        return True
+    return normalized in {"持续关注成本。", "持续关注成本", "暂无。", "无。"} or bool(
+        re.fullmatch(r"(?:建议|请)?持续关注(?:成本|相关指标)[。.!！]??", normalized)
+    )
+
+
+def _build_dashboard_tasks(data: dict, waterfall: dict) -> str:
+    """Build the minimum executable supplement when model advice is incomplete."""
+
+    factors = [item for item in waterfall.get('items', []) if not item.get('is_total')]
+    factors.sort(key=lambda item: abs(float(item.get('value') or 0)), reverse=True)
+    month = str(data.get('month') or '')
+    deadline = f"{month}后5个工作日内" if month else "5个工作日内"
+    tasks = []
+    for item in factors:
+        name = str(item.get('name') or '').replace('变动', '')
+        if name == '直接材料':
+            tasks.append(f"采购部核查主要药材采购入库价、合同单价、领料单和单位消耗，提交《直接材料价格与单耗差异表》，{deadline}完成。")
+        elif name == '直接人工':
+            tasks.append(f"生产部复核总工时、工资率、排班与产量摊薄，提交《人工效率复核记录及改善方案》，{deadline}完成。")
+        elif name == '制造费用':
+            tasks.append(f"设备部会同财务部核对能耗、维修、折旧和费用分摊，提交《制造费用分摊差异表》，{deadline}完成。")
+    if not tasks:
+        tasks = [f"财务部复核成本明细与预算差异，提交《月度成本差异核查表》，{deadline}完成。",
+                 f"生产部复核单耗、工时和产量口径，提交《成本数据勾稽记录》，{deadline}完成。"]
+    return "\n\n".join(f"{index}. {task}" for index, task in enumerate(tasks[:3], 1))
 
 
 def three_dim_compare(product: str, month: str) -> dict:
@@ -194,9 +361,11 @@ def cost_trend(product: str) -> dict:
 
 def cost_heatmap(products: list[str] | None = None) -> dict:
     """产品×月份×成本要素热力图数据（单位成本口径，元/盒）。"""
-    selected_products = [p for p in (products or PRODUCTS) if p in PRODUCTS]
+    available_products = [item['name'] for item in cost_service.get_products()]
+    months = cost_service.get_months()
+    selected_products = [p for p in (products or available_products) if p in available_products]
     if not selected_products:
-        selected_products = list(PRODUCTS)
+        selected_products = list(available_products)
 
     elements = {
         'unit_cost': '单位成本',
@@ -206,7 +375,7 @@ def cost_heatmap(products: list[str] | None = None) -> dict:
     }
     values = {key: [] for key in elements}
     for product_idx, product in enumerate(selected_products):
-        for month_idx, month in enumerate(MONTHS):
+        for month_idx, month in enumerate(months):
             summary = cost_service.get_cost_summary(product, month) or {}
             for key in elements:
                 value = summary.get(key)
@@ -214,7 +383,7 @@ def cost_heatmap(products: list[str] | None = None) -> dict:
 
     return {
         'products': selected_products,
-        'months': list(MONTHS),
+        'months': months,
         'elements': elements,
         'values': values,
     }
@@ -349,17 +518,17 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
         )
         source = 'fallback'
         try:
-            from llm.client import llm_client
             from llm.prompts import DASHBOARD_ATTRIBUTION_PROMPT, SYSTEM_ROLE
-            text = llm_client.chat(
+            text = _model_text_with_timeout(
                 DASHBOARD_ATTRIBUTION_PROMPT.format(
                     product=product,
                     month=month,
                     context=json.dumps(context, ensure_ascii=False, indent=2),
-                    rag_context=rag_context or '本次无阈值告警，不使用知识库。',
+                    rag_context=rag_context or '知识库检索正在初始化或本次未检索到匹配片段；不得因此停止归因，请先基于看板数据生成分析，待核查事项明确标注。',
                 ),
-                system=SYSTEM_ROLE,
-                max_tokens=1800,
+                SYSTEM_ROLE,
+                _LLM_STREAM_TIMEOUT_SECONDS,
+                max_tokens=_ATTRIBUTION_MAX_TOKENS,
             )
             if text and str(text).strip():
                 source = 'ai'
@@ -368,7 +537,7 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
         text = text or fallback
         used_rag_sources = rag_sources if source == 'ai' else []
         if used_rag_sources:
-            text = _append_rag_sources(text, used_rag_sources)
+            text = _append_rag_sources(text, used_rag_sources, rag_results)
         else:
             text = _append_data_only_notice(text)
         text = _ensure_focus_analysis(text, data, waterfall, material)
@@ -476,10 +645,13 @@ def dashboard_attribution_stream(product: str, month: str, force: bool = False):
             prompt = DASHBOARD_ATTRIBUTION_PROMPT.format(
                 product=product, month=month,
                 context=json.dumps(context, ensure_ascii=False, indent=2),
-                rag_context=rag_context or '本次无阈值告警，不使用知识库。',
+                rag_context=rag_context or '知识库检索正在初始化或本次未检索到匹配片段；不得因此停止归因，请先基于看板数据生成分析，待核查事项明确标注。',
             )
+            # Consume the provider's real streaming response. Each model
+            # delta is forwarded immediately; the timeout guard prevents a
+            # stalled upstream iterator from keeping the SSE request open.
             for chunk in _model_stream_with_timeout(
-                prompt, SYSTEM_ROLE, _LLM_STREAM_TIMEOUT_SECONDS, max_tokens=1800
+                prompt, SYSTEM_ROLE, _LLM_STREAM_TIMEOUT_SECONDS, max_tokens=_ATTRIBUTION_MAX_TOKENS
             ):
                 if chunk:
                     text += str(chunk)
@@ -489,18 +661,29 @@ def dashboard_attribution_stream(product: str, month: str, force: bool = False):
                 raise RuntimeError('模型未返回归因文本')
             source = 'ai'
         except Exception as exc:
-            logger.warning("归因模型调用失败，使用规则兜底: product=%s month=%s error=%s", product, month, exc)
-            model_failed = True
-            text = fallback
-            source = 'fallback'
+            # A provider can time out after it has already streamed useful
+            # prose. Keep that model text visible instead of replacing it
+            # with a generic fallback document.
+            if streamed_text and text.strip():
+                logger.warning("归因模型流式未完成，保留已生成内容: product=%s month=%s error=%s", product, month, exc)
+                source = 'ai_partial'
+            else:
+                logger.warning("归因模型调用失败，使用规则兜底: product=%s month=%s error=%s", product, month, exc)
+                model_failed = True
+                text = fallback
+                source = 'fallback'
         text = text or fallback
         used_rag_sources = rag_sources if source == 'ai' else []
-        text = _append_rag_sources(text, used_rag_sources) if used_rag_sources else _append_data_only_notice(text)
+        text = _append_rag_sources(text, used_rag_sources, rag_results) if used_rag_sources else _append_data_only_notice(text)
         text = _ensure_focus_analysis(text, data, waterfall, material)
         if source == 'ai':
             _ATTRIBUTION_CACHE[cache_key] = {'analysis': text, 'source': source, 'rag_sources': used_rag_sources}
         # 模型在首个chunk前失败时也补发完整文本，前端不会只看到空白。
         if source == 'fallback' and (model_failed or not streamed_text):
+            # If some model deltas were already displayed, replace the partial
+            # text instead of appending a duplicate fallback document.
+            yield {'event': 'replace', 'data': {'text': text}}
+        elif source == 'fallback':
             yield from replay(text)
         yield {'event': 'complete', 'data': result_payload(text, source, used_rag_sources, False)}
 
@@ -526,23 +709,20 @@ def _run_with_timeout(fn, timeout: float, default):
 
 def _model_stream_with_timeout(prompt: str, system: str, timeout: float, max_tokens: int = 1800):
     """消费LLM流式响应并设置总超时，避免SSE连接无限等待。"""
-    result_queue = queue.Queue(maxsize=128)
+    # Do not use a bounded queue here. A fast provider can emit more than 128
+    # deltas before the ASGI response gets scheduled; dropping the terminal
+    # ``done`` marker would make the consumer wait until the hard timeout.
+    result_queue = queue.Queue()
 
     def worker():
         try:
             from llm.client import llm_client
             for chunk in llm_client.chat_stream(prompt, system=system, max_tokens=max_tokens):
                 if chunk:
-                    try:
-                        result_queue.put(('chunk', str(chunk)), timeout=0.2)
-                    except queue.Full:
-                        return
-            result_queue.put(('done', None), timeout=0.2)
+                    result_queue.put(('chunk', str(chunk)))
+            result_queue.put(('done', None))
         except Exception as exc:
-            try:
-                result_queue.put(('error', exc), timeout=0.2)
-            except queue.Full:
-                pass
+            result_queue.put(('error', exc))
 
     threading.Thread(target=worker, daemon=True, name="dashboard-attribution-llm").start()
     deadline = time.monotonic() + timeout
@@ -562,10 +742,34 @@ def _model_stream_with_timeout(prompt: str, system: str, timeout: float, max_tok
             raise value
 
 
+def _model_text_with_timeout(prompt: str, system: str, timeout: float, max_tokens: int = 1800) -> str:
+    """Call the complete-text API with a hard wall-clock timeout."""
+    result_queue = queue.Queue(maxsize=1)
+
+    def worker():
+        try:
+            from llm.client import llm_client
+            result_queue.put((True, str(llm_client.chat(prompt, system=system, max_tokens=max_tokens) or "")), block=False)
+        except Exception as exc:
+            try:
+                result_queue.put((False, exc), block=False)
+            except queue.Full:
+                pass
+
+    threading.Thread(target=worker, daemon=True, name="dashboard-attribution-llm-text").start()
+    try:
+        ok, value = result_queue.get(timeout=timeout)
+    except queue.Empty as exc:
+        raise TimeoutError(f"模型调用超过{timeout:.0f}秒") from exc
+    if not ok:
+        raise value
+    return value
+
+
 def _dashboard_rag_results(product: str, month: str, data: dict, material: dict) -> list[dict]:
     """仅针对阈值告警检索归因依据，避免普通分析增加延迟。"""
     try:
-        from rag.retriever import hybrid_search
+        from rag.retriever import bm25_search, hybrid_search
         metrics = '；'.join(
             f"{alert.get('metric', '')} 环比{alert.get('change', '')}%"
             for alert in data.get('alerts', [])
@@ -576,6 +780,12 @@ def _dashboard_rag_results(product: str, month: str, data: dict, material: dict)
             if item.get('material_name')
         )
         query = f"{product} {month} 成本归因 {metrics} {material_names} 采购价格 单耗 提取工艺 设备 生产日历"
+        # Keyword retrieval is available from the persisted cache even while
+        # Chroma/embedding initialization is still running. Use it first so a
+        # cold-start vector model cannot block attribution generation.
+        keyword_results = bm25_search(query, top_k=3)
+        if keyword_results:
+            return keyword_results
         return hybrid_search(query, top_k=3)
     except Exception:
         return []
@@ -595,13 +805,54 @@ def _rag_source_names(results: list[dict] | None) -> list[str]:
         return names
 
 
-def _append_rag_sources(text: str, sources: list[str]) -> str:
-    """强制在报告文本中保留实际使用的知识库来源。"""
-    marker = '## 知识库来源'
-    if marker in text:
-        return text
-    lines = '\n'.join(f"- {source}" for source in sources)
-    return f"{text.rstrip()}\n\n{marker}\n\n{lines}"
+def _append_rag_sources(text: str, sources: list[str], results: list[dict] | None = None) -> str:
+    """保留实际使用的知识库来源，并以简短摘要展示依据。"""
+    marker = '## 知识库依据'
+    existing_marker = re.search(r"(?m)^\s*#{1,6}\s*知识库(?:依据|来源)\s*[:：]?\s*$", str(text))
+    evidence_lines = _compact_rag_evidence(sources, results)
+    evidence_text = "\n".join(evidence_lines)
+    if existing_marker:
+        # The source chapter is always normalized from retrieved results so a
+        # verbose model-generated citation cannot leak into the final report.
+        prefix = str(text)[:existing_marker.start()].rstrip()
+        heading = str(text)[existing_marker.start():existing_marker.end()].strip()
+        return f"{prefix}\n\n{heading}\n\n{evidence_text}"
+    return f"{str(text).rstrip()}\n\n{marker}\n\n{evidence_text}"
+
+
+def _compact_source_body(value: str, max_chars: int = 110) -> str:
+    """压缩模型生成的来源章节，保留文件名和核心依据。"""
+    lines = []
+    for raw_line in str(value or '').splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        if len(line) > max_chars:
+            sentence = re.split(r"(?<=[。！？.!?；;])\s*", line)[0].strip()
+            line = sentence if sentence and len(sentence) <= max_chars else f"{line[:max_chars - 1].rstrip()}…"
+        if line not in lines:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _compact_rag_evidence(sources: list[str], results: list[dict] | None = None) -> list[str]:
+    """每个知识库文件只展示一条简短、可追溯的依据。"""
+    evidence_lines = []
+    seen_sources = set()
+    for result in results or []:
+        source = str(result.get('source') or '知识库').strip()
+        if not source or source in seen_sources:
+            continue
+        content = _compact_source_body(result.get('content', ''), max_chars=100)
+        content = content.splitlines()[0] if content else '本次分析引用了该文档。'
+        seen_sources.add(source)
+        evidence_lines.append(f"- [来源：{source}] {content}")
+    for source in sources:
+        source = str(source or '').strip()
+        if source and source not in seen_sources:
+            seen_sources.add(source)
+            evidence_lines.append(f"- [来源：{source}] 本次分析引用了该文档。")
+    return evidence_lines or ["- 本次未使用知识库依据。"]
 
 
 def _append_data_only_notice(text: str) -> str:
@@ -622,16 +873,19 @@ def _build_attribution_fallback(data: dict, waterfall: dict, material: dict) -> 
     ]
     factors = [item for item in waterfall.get('items', []) if not item.get('is_total')]
     factors.sort(key=lambda item: abs(item.get('value', 0)), reverse=True)
-    parts.append("## 重点分析" if _focus_alerts(data) else "## 常规分析")
-    for item in factors:
-        pct = item.get('contribution_pct')
-        pct_text = f"贡献总变动的{pct:.1f}%" if pct is not None else "贡献度无法计算"
-        parts.append(f"- **{item['name'].replace('变动', '')}**{'上涨' if item['value'] > 0 else '下降'}{abs(item['value']):.2f}元/盒（{pct_text}）。")
-    top_material = (material.get('materials') or [None])[0]
-    if top_material:
-        material_mom = top_material.get('mom_change')
-        material_mom_text = f"{material_mom:+.2f}%" if material_mom is not None else "暂无环比数据"
-        parts.append(f"明细显示，**{top_material.get('material_name', '主要原材料')}**单位成本为{top_material.get('unit_cost', 0):.4f}元/盒，环比{material_mom_text}。")
+    if _focus_alerts(data):
+        parts.append(_focus_analysis_section(data, waterfall, material))
+    else:
+        parts.append("## 常规分析")
+        for item in factors:
+            pct = item.get('contribution_pct')
+            pct_text = f"贡献总变动的{pct:.1f}%" if pct is not None else "贡献度无法计算"
+            parts.append(f"- **{item['name'].replace('变动', '')}**{'上涨' if item['value'] > 0 else '下降'}{abs(item['value']):.2f}元/盒（{pct_text}）。")
+        top_material = (material.get('materials') or [None])[0]
+        if top_material:
+            material_mom = top_material.get('mom_change')
+            material_mom_text = f"{material_mom:+.2f}%" if material_mom is not None else "暂无环比数据"
+            parts.append(f"明细显示，**{top_material.get('material_name', '主要原材料')}**单位成本为{top_material.get('unit_cost', 0):.4f}元/盒，环比{material_mom_text}。")
     parts.extend([
         "## 改进建议",
         "1. 采购部门核查主要原材料采购价格、合同调价条款及供应商报价变动。",

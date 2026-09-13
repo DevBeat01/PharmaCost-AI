@@ -16,6 +16,8 @@ def test_resource_versions_publish_and_history(tmp_path: Path):
     # The same content is content-addressed and does not create a duplicate version.
     duplicate = manager.save_bytes("data", "cost_2026", "renamed.csv", b"a,b\n1,2\n")
     assert duplicate["resource_id"] == first["resource_id"]
+    assert duplicate["filename"] == "renamed.csv"
+    assert duplicate["metadata"]["original_filename"] == "renamed.csv"
 
     second = manager.save_bytes("data", "cost_2026", "cost.csv", b"a,b\n3,4\n")
     assert second["version"] == 2

@@ -132,7 +132,7 @@ EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", str(APP_DIR / "chroma_db"))
 
 # RPA服务
-RPA_BASE_URL = os.getenv("RPA_BASE_URL", "http://localhost:8090")
+RPA_BASE_URL = os.getenv("RPA_BASE_URL", "http://127.0.0.1:8090")
 RPA_TASK_DB_PATH = Path(os.getenv("RPA_TASK_DB_PATH", str(APP_DIR / "rpa_tasks.sqlite3")))
 
 # 检索参数

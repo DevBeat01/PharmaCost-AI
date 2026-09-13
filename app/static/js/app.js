@@ -64,7 +64,10 @@
             const timer = setTimeout(() => controller.abort(), timeoutMs);
             try {
                 const resp = await fetch(url, { ...fetchOptions, signal: controller.signal });
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                if (!resp.ok) {
+                    if (resp.status === 401 && window.Auth) window.Auth.handleUnauthorized();
+                    throw new Error(`HTTP ${resp.status}`);
+                }
                 return await resp.json();
             } catch (e) {
                 console.error('[API Error]', url, e);
@@ -94,9 +97,13 @@
                 const resp = await fetch(url, {
                     ...fetchOptions,
                     signal: controller.signal,
+                    credentials: 'same-origin',
                     headers: { Accept: 'text/event-stream', ...(fetchOptions.headers || {}) },
                 });
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                if (!resp.ok) {
+                    if (resp.status === 401 && window.Auth) window.Auth.handleUnauthorized();
+                    throw new Error(`HTTP ${resp.status}`);
+                }
                 if (!resp.body) throw new Error('浏览器不支持流式响应');
                 const reader = resp.body.getReader();
                 const decoder = new TextDecoder();
@@ -336,6 +343,126 @@
         rpa: { title: 'RPA整改', subtitle: '自动化任务管理与闭环' }
     };
 
+    /* ============ 登录会话 ============ */
+    let appInitialized = false;
+    const Auth = {
+        async init() {
+            this.bindEvents();
+            const session = await this.getSession();
+            if (session.authenticated) {
+                this.showApp(session.username);
+                this.startApp();
+            } else {
+                this.showLogin();
+            }
+        },
+
+        bindEvents() {
+            const form = document.getElementById('loginForm');
+            form?.addEventListener('submit', event => this.login(event));
+            document.getElementById('logoutButton')?.addEventListener('click', () => this.logout());
+        },
+
+        async getSession() {
+            try {
+                const response = await fetch('/api/auth/me', { credentials: 'same-origin' });
+                return response.ok ? await response.json() : { authenticated: false };
+            } catch (_) {
+                return { authenticated: false };
+            }
+        },
+
+        async login(event) {
+            event.preventDefault();
+            const username = document.getElementById('loginUsername')?.value.trim() || '';
+            const password = document.getElementById('loginPassword')?.value || '';
+            const error = document.getElementById('loginError');
+            const submit = document.getElementById('loginSubmit');
+            if (!username || !password) {
+                if (error) error.textContent = '请输入账号和密码';
+                return;
+            }
+            if (error) error.textContent = '';
+            if (submit) {
+                submit.disabled = true;
+                submit.innerHTML = '<span class="login-button-loader"></span><span>正在验证…</span>';
+            }
+            try {
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password }),
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || !data.authenticated) throw new Error(data.detail || '登录失败，请稍后重试');
+                this.showApp(data.username);
+                this.startApp();
+            } catch (err) {
+                if (error) error.textContent = err.message || '登录失败，请稍后重试';
+            } finally {
+                if (submit) {
+                    submit.disabled = false;
+                    submit.innerHTML = '<i data-lucide="arrow-right" style="width:16px;height:16px"></i><span>进入系统</span>';
+                    refreshIcons();
+                }
+            }
+        },
+
+        async logout() {
+            try {
+                await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+            } finally {
+                this.showLogin();
+            }
+        },
+
+        handleUnauthorized() {
+            if (document.body.classList.contains('is-authenticated')) {
+                this.showLogin('登录会话已失效，请重新登录');
+            }
+        },
+
+        showApp(username) {
+            document.body.classList.add('is-authenticated');
+            const name = document.querySelector('.user-name');
+            const avatar = document.querySelector('.user-avatar');
+            if (name && username) name.textContent = username;
+            if (avatar && username) avatar.textContent = username.slice(0, 1);
+            document.getElementById('loginPassword').value = '';
+            refreshIcons();
+        },
+
+        showLogin(message = '') {
+            document.body.classList.remove('is-authenticated');
+            const error = document.getElementById('loginError');
+            if (error) error.textContent = message;
+            const password = document.getElementById('loginPassword');
+            if (password) password.value = '';
+            setTimeout(() => document.getElementById('loginUsername')?.focus(), 0);
+        },
+
+        startApp() {
+            if (appInitialized) return;
+            appInitialized = true;
+            this.bootApp();
+        },
+
+        async bootApp() {
+            Utils.showLoading('系统初始化中...');
+            Router.init();
+            Utils.hideLoading();
+            try {
+                await Selectors.loadProducts();
+            } finally {
+                Utils.hideLoading();
+                AppState.selectorsReady = true;
+                Router.renderPage(AppState.currentPage);
+                setTimeout(refreshIcons, 50);
+            }
+        }
+    };
+
     /* ============ 路由 ============ */
     const Router = {
         pages: ['dashboard', 'report', 'benchmark', 'rpa'],
@@ -440,15 +567,17 @@
                 `<option value="${m}" ${m === AppState.currentMonth ? 'selected' : ''}>${m}</option>`
             ).join('');
 
-            prodSel.addEventListener('change', () => {
+            // loadProducts() can run after every data import; assigning the
+            // handler keeps repeated refreshes from stacking listeners.
+            prodSel.onchange = () => {
                 AppState.currentProduct = prodSel.value;
                 Router.renderPage(AppState.currentPage);
-            });
+            };
 
-            monthSel.addEventListener('change', () => {
+            monthSel.onchange = () => {
                 AppState.currentMonth = monthSel.value;
                 Router.renderPage(AppState.currentPage);
-            });
+            };
         }
     };
 
@@ -465,23 +594,11 @@
     window.Router = Router;
     window.Selectors = Selectors;
     window.Icons = Icons;
+    window.Auth = Auth;
 
     /* ============ 启动 ============ */
     document.addEventListener('DOMContentLoaded', async () => {
-        Utils.showLoading('系统初始化中...');
-        // 路由必须先启动，避免产品接口异常时整个 SPA 被锁在当前模块。
-        Router.init();
-        // 路由和页面骨架已就绪，立即解除全屏遮罩；各页面自行显示局部加载状态。
-        Utils.hideLoading();
-        try {
-            await Selectors.loadProducts();
-        } finally {
-            Utils.hideLoading();
-            // 产品数据到达后刷新当前页面，补齐页面级下拉框和真实数据。
-            AppState.selectorsReady = true;
-            Router.renderPage(AppState.currentPage);
-            setTimeout(refreshIcons, 50);
-        }
+        Auth.init();
     });
 
 })();

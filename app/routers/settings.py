@@ -116,7 +116,9 @@ def _write_model_overrides(data: dict) -> None:
 
 def _mask_key(value: str) -> str:
     value = str(value or "")
-    return (value[:4] + "*" * max(4, len(value) - 8) + value[-4:]) if len(value) > 8 else ("已配置" if value else "未配置")
+    # Keep the status compact; exposing one asterisk per secret character
+    # makes long provider keys overflow the settings dialog.
+    return (value[:4] + "••••••••" + value[-4:]) if len(value) > 8 else ("已配置" if value else "未配置")
 
 def _model_summary() -> dict:
     return {
@@ -135,7 +137,8 @@ def _file_info(path: Path, *, deletable: bool, key: str | None = None,
         size = 0
         updated_at = ""
     info = {
-        "key": key, "label": label or path.name, "name": path.name,
+        "key": key, "label": label or path.name,
+        "name": _resource_filename(resource) if resource else path.name,
         "size": size, "updated_at": updated_at,
         "imported": deletable, "deletable": deletable,
     }
@@ -302,9 +305,10 @@ async def update_models(payload: ModelConfigPayload):
     updates = {}
     for key, value in values.items():
         config_key = mapping[key]
-        if key.endswith("_api_key") and value == "":
-            continue
         if isinstance(value, str): value = value.strip()
+        if key.endswith("_api_key") and not value:
+            # An empty/whitespace key means "keep the current key" in the UI.
+            continue
         if config_key.endswith("_BASE_URL") and value and not str(value).startswith(("http://", "https://")):
             raise HTTPException(422, "接口地址必须以 http:// 或 https:// 开头")
         if config_key.endswith("_MODEL") and not value:
@@ -318,6 +322,13 @@ async def update_models(payload: ModelConfigPayload):
             globals()[name] = getattr(config_module, name)
         from llm.client import llm_client
         llm_client.reload()
+        # A changed provider/model must not leave the dashboard serving an
+        # attribution generated with the previous configuration.
+        try:
+            from analysis.dashboard import _ATTRIBUTION_CACHE
+            _ATTRIBUTION_CACHE.clear()
+        except Exception:
+            pass
     except Exception as exc:
         raise HTTPException(500, f"配置已保存，但模型客户端重载失败: {exc}") from exc
     return {"message": "模型配置已保存并生效", "summary": _summary()}
@@ -332,6 +343,11 @@ async def reset_models():
             globals()[name] = getattr(config_module, name)
         from llm.client import llm_client
         llm_client.reload()
+        try:
+            from analysis.dashboard import _ATTRIBUTION_CACHE
+            _ATTRIBUTION_CACHE.clear()
+        except Exception:
+            pass
     except Exception as exc:
         raise HTTPException(500, f"配置已恢复，但模型客户端重载失败: {exc}") from exc
     return {"message": "模型配置已恢复为环境变量设置", "summary": _summary()}
@@ -343,13 +359,20 @@ async def upload_data_file(key: str, file: UploadFile = File(...)):
         raise HTTPException(404, "未知数据文件类型")
     content, filename = await _read_upload(file, {".csv"})
     try:
-        uploaded_columns = set(pd.read_csv(BytesIO(content), encoding="utf-8-sig", nrows=0).columns.str.strip())
+        uploaded = pd.read_csv(BytesIO(content), encoding="utf-8-sig")
+        uploaded.columns = uploaded.columns.str.strip()
+        uploaded_columns = set(uploaded.columns)
         expected_columns = set(pd.read_csv(DATA_FILE_DEFAULTS[key], encoding="utf-8-sig", nrows=0).columns.str.strip())
     except Exception as exc:
         raise HTTPException(422, f"CSV 无法读取: {exc}") from exc
     missing = expected_columns - uploaded_columns
     if missing:
         raise HTTPException(422, f"CSV 缺少必要字段: {', '.join(sorted(missing))}")
+    if uploaded.empty:
+        raise HTTPException(422, "CSV 不得为空")
+    for required in ("产品名称", "月份"):
+        if required in uploaded.columns and uploaded[required].isna().all():
+            raise HTTPException(422, f"CSV 至少需要一条有效{required}数据")
 
     record = resource_manager.save_bytes(
         "data", key, filename, content,
@@ -500,5 +523,6 @@ async def delete_resource(resource_id: str):
         raise HTTPException(404, "资源版本不存在")
     if resource["status"] == "active":
         raise HTTPException(409, "当前版本正在使用，请通过对应设置接口恢复默认后再删除")
-    resource_manager.discard(resource_id)
+    if not resource_manager.discard(resource_id):
+        raise HTTPException(409, "资源版本当前不可删除")
     return {"message": "资源历史版本已删除", "summary": _summary()}

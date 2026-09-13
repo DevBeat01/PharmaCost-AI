@@ -6,19 +6,35 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="制药企业成本智能分析与归因报告平台 - GMP合规级数据看板">
   <title>成本智能分析系统 | ERP</title>
-  <link rel="icon"
-    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='3' fill='%23d4610a'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3.5' stroke-linecap='square'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/css/style.css?v=20260907-6">
+  <link rel="icon" type="image/svg+xml" href="/static/images/logo-concept-v1.svg?v=20260912">
+  <link rel="stylesheet" href="/static/css/style.css?v=20260910-2">
   <script src="/static/vendor/echarts.min.js"></script>
   <script src="/static/vendor/lucide.min.js"></script>
 </head>
 
 <body class="min-h-screen font-sans antialiased">
+  <section class="login-screen" id="loginScreen" aria-labelledby="loginTitle">
+    <div class="login-shell">
+      <div class="login-copy">
+        <span class="login-kicker">PHARMACOST · AI</span>
+        <h1 id="loginTitle">医药成本分析系统</h1>
+        <p>面向制药企业的成本洞察、归因分析与报告协作平台。</p>
+      </div>
+      <form class="login-form" id="loginForm" novalidate>
+        <div class="login-form-heading"><h2>登录工作台</h2><span>安全会话</span></div>
+        <label class="login-field">账号<input id="loginUsername" name="username" type="text" autocomplete="username" placeholder="请输入账号" required></label>
+        <label class="login-field">密码<input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="请输入密码" required></label>
+        <div class="login-error" id="loginError" role="alert" aria-live="polite"></div>
+        <button class="btn btn-primary login-submit" id="loginSubmit" type="submit"><i data-lucide="arrow-right" style="width:16px;height:16px"></i><span>进入系统</span></button>
+        <p class="login-hint">请使用系统管理员分配的账号登录</p>
+      </form>
+    </div>
+  </section>
   <div class="app-shell">
     <!-- LEFT SIDEBAR -->
     <aside class="sidebar">
       <div class="sidebar-brand">
-        <img src="/static/images/logo1.png" alt="Logo"
+        <img src="/static/images/logo-concept-v1.svg" alt="PharmaCost AI Logo"
           style="width:50px;height:50px;object-fit:contain;flex-shrink:0;border-radius:6px">
         <div class="brand-text">
           <div class="brand-title">医药成本分析系统</div>
@@ -82,6 +98,9 @@
               <div class="user-role">财务部</div>
             </div>
           </div>
+          <button class="header-icon-btn" id="logoutButton" aria-label="退出登录" title="退出登录">
+            <i data-lucide="log-out" style="width:18px;height:18px"></i>
+          </button>
         </div>
       </header>
 
@@ -151,8 +170,7 @@
         </section>
         <section class="settings-section" aria-labelledby="settingsDataTitle">
           <div class="settings-section-title">
-            <div><h3 id="settingsDataTitle">成本数据文件</h3><p>导入 CSV 后立即校验并重载；删除导入文件将恢复竞赛默认数据。</p></div>
-            <button class="settings-action-button" id="settingsReloadData" type="button"><i data-lucide="refresh-cw"></i>重载数据</button>
+            <div><h3 id="settingsDataTitle">成本数据文件</h3><p>导入 CSV 后立即校验并生效；删除导入文件将恢复竞赛默认数据。</p></div>
           </div>
           <div class="settings-file-list" id="settingsDataFiles"></div>
         </section>
@@ -190,7 +208,7 @@
   </div>
 
   <!-- Scripts -->
-  <script src="/static/js/app.js?v=20260908-1"></script>
+  <script src="/static/js/app.js?v=20260910-1"></script>
   <script src="/static/js/settings.js?v=20260909-1"></script>
   <script src="/static/js/dashboard.js?v=20260907-5"></script>
   <script src="/static/js/report.js?v=20260904-1"></script>

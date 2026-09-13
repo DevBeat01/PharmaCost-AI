@@ -34,7 +34,7 @@ const RpaPage = {
                     <h3 class="card-title">整改任务列表</h3>
                 </div>
                 <div class="filter-bar" style="margin-bottom:16px">
-                    <div class="field"><label>状态</label><select id="filterStatus"><option value="">全部</option><option value="draft">待派发</option><option value="sent">已发送</option><option value="received">已送达</option><option value="confirmed">已确认</option><option value="in_progress">处理中</option><option value="completed">已完成</option><option value="overdue">已逾期</option><option value="failed">失败</option></select></div>
+                    <div class="field"><label>状态</label><select id="filterStatus"><option value="">全部</option><option value="draft">待派发</option><option value="sent">已发送</option><option value="received">已送达</option><option value="confirmed">已确认</option><option value="in_progress">处理中</option><option value="completed">已完成</option><option value="overdue">已逾期</option></select></div>
                     <div class="field"><label>优先级</label><select id="filterPriority"><option value="">全部</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></div>
                     <div class="field"><label>产品</label><select id="filterProduct"><option value="">全部</option>${AppState.products.map(p => `<option value="${Utils.productName(p)}">${Utils.productLabel(p)}</option>`).join('')}</select></div>
                     <div class="field"><label>月份</label><select id="filterMonth"><option value="">全部</option>${AppState.months.map(m => `<option value="${m}">${m}</option>`).join('')}</select></div>
@@ -126,7 +126,7 @@ const RpaPage = {
         const statusMap = {
             draft: ['待派发', 'info'], sent: ['已发送', 'info'], received: ['已送达', 'info'],
             confirmed: ['已确认', 'warning'], in_progress: ['处理中', 'warning'], completed: ['已完成', 'success'],
-            overdue: ['已逾期', 'error'], failed: ['失败', 'error'],
+            overdue: ['已逾期', 'error'],
         };
         const priorityMap = { high: ['高', 'error'], medium: ['中', 'warning'], low: ['低', 'success'] };
         const pendingRpa = tasks.filter(task => task.status === 'draft');
@@ -146,7 +146,7 @@ const RpaPage = {
             const status = statusMap[task.status] || ['未知', 'info'];
             const priority = priorityMap[task.priority] || priorityMap.medium;
             // 已发送微信的任务不再参与通知选择，但仍保留删除操作。
-            const rowSelectable = selectable && task.status !== 'failed' && task.notification_status !== 'sent';
+            const rowSelectable = selectable && task.notification_status !== 'sent';
             const selected = this._selectedTaskIds.has(task.task_id);
             const owner = `${task.assignee?.department || '--'} / ${task.assignee?.role || '--'}`;
             const source = task.source || {};
@@ -253,8 +253,13 @@ const RpaPage = {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ task_ids: taskIds }), timeoutMs: 30000,
             });
-            this.showResult(result.tasks_dispatched > 0, `已发送${result.tasks_dispatched || 0}项整改任务至 RPA`);
-            this._selectedTaskIds.clear();
+            const firstFailure = (result.results || []).find(item => item.status !== 'sent');
+            const dispatched = result.tasks_dispatched || 0;
+            const message = dispatched > 0
+                ? `已发送${dispatched}项整改任务至 RPA`
+                : (firstFailure?.error || 'RPA派发失败，请检查服务状态');
+            this.showResult(dispatched > 0, message);
+            if (dispatched > 0) this._selectedTaskIds.clear();
             await Promise.all([this.loadStats(), this.loadTasks()]);
         } catch (error) {
             this.showResult(false, 'RPA派发失败，请检查服务状态');
@@ -342,7 +347,7 @@ const TaskDraftDialog = {
         const rows = drafts.map(task => `
             <tr data-task-id="${Utils.escapeHtml(task.task_id)}">
                 <td><input type="checkbox" class="draft-dialog-selector" aria-label="选择${Utils.escapeHtml(task.task_title)}"></td>
-                <td class="draft-title-cell"><textarea class="draft-field" data-field="task_title" rows="2" aria-label="任务标题">${Utils.escapeHtml(task.task_title)}</textarea></td>
+                <td class="draft-title-cell"><textarea class="draft-field" data-field="task_title" rows="2" aria-label="任务标题">${Utils.escapeHtml(task.task_title)}</textarea><div class="draft-expected-result">交付：${Utils.escapeHtml(task.expected_result || task.suggestion || '--')}</div></td>
                 <td class="draft-owner-fields">
                     <input class="draft-field" data-field="assignee_name" value="${Utils.escapeHtml(task.assignee?.name || '')}" placeholder="姓名" aria-label="责任人姓名">
                     <input class="draft-field" data-field="assignee_department" value="${Utils.escapeHtml(task.assignee?.department || '')}" placeholder="部门" aria-label="责任部门">

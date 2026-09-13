@@ -17,7 +17,6 @@
             document.addEventListener('keydown', event => {
                 if (event.key === 'Escape' && this.dialog && !this.dialog.hidden) this.close();
             });
-            document.getElementById('settingsReloadData')?.addEventListener('click', () => this.action('/api/settings/reload-data', '成本数据已重新加载'));
             document.getElementById('settingsRebuildKnowledge')?.addEventListener('click', () => this.action('/api/settings/rebuild-knowledge', '知识库重建任务已启动'));
             document.getElementById('settingsSaveModels')?.addEventListener('click', () => this.saveModels());
             document.getElementById('settingsResetModels')?.addEventListener('click', () => this.resetModels());
@@ -235,7 +234,11 @@
                 const id = resourceButton.dataset.resourceId;
                 const prompt = action === 'rollback' ? '确认将此历史版本恢复为当前版本？' : '确认删除此历史资源版本？删除后不可恢复。';
                 if (!window.confirm(prompt)) return;
-                const endpoint = `/api/settings/resources/${encodeURIComponent(id)}/${action}`;
+                // Rollback is an action endpoint, while deletion is the
+                // resource endpoint itself: DELETE /resources/{resource_id}.
+                const endpoint = action === 'rollback'
+                    ? `/api/settings/resources/${encodeURIComponent(id)}/rollback`
+                    : `/api/settings/resources/${encodeURIComponent(id)}`;
                 await this.action(endpoint, action === 'rollback' ? '资源已回滚' : '历史版本已删除', action === 'rollback' ? 'POST' : 'DELETE');
                 return;
             }
@@ -288,6 +291,7 @@
         },
 
         async refreshApplicationData() {
+            if (typeof DashboardPage !== 'undefined') DashboardPage.clearAttributionCache();
             await Selectors.loadProducts();
             Router.renderPage(AppState.currentPage);
         },

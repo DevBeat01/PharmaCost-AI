@@ -1,7 +1,7 @@
 """FastAPI应用入口"""
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from pathlib import Path
 import sys
 import os
@@ -17,7 +17,7 @@ logger = logging.getLogger("main")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from data.cost_data import cost_service
-from routers import dashboard, report, benchmark, rpa_router, settings
+from routers import dashboard, report, benchmark, rpa_router, settings, auth
 
 app = FastAPI(
     title="制药成本智能分析报告系统",
@@ -29,6 +29,8 @@ API_KEY = os.getenv("API_KEY", "")
 from security import SecurityHeadersMiddleware, setup_exception_handlers
 
 app.add_middleware(SecurityHeadersMiddleware)
+from security import AuthMiddleware
+app.add_middleware(AuthMiddleware)
 setup_exception_handlers(app)
 
 if API_KEY:
@@ -48,6 +50,7 @@ app.include_router(report.router, prefix="/api/report", tags=["报告"])
 app.include_router(benchmark.router, prefix="/api/benchmark", tags=["对标"])
 app.include_router(rpa_router.router, prefix="/api/rpa", tags=["RPA"])
 app.include_router(settings.router, prefix="/api/settings", tags=["设置"])
+app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
 
 
 @app.on_event("startup")
@@ -79,15 +82,11 @@ async def root():
 
 @app.get("/favicon.ico")
 async def favicon():
-    """内联SVG favicon,避免404"""
-    svg = (
-        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
-        "<text y='.9em' font-size='90'>💊</text></svg>"
-    )
-    return Response(
-        content=svg.encode("utf-8"),
+    """返回应用 Logo 作为 favicon，兼容浏览器默认的 /favicon.ico 请求。"""
+    return FileResponse(
+        str(static_dir / "images" / "logo-concept-v1.svg"),
         media_type="image/svg+xml",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"},
     )
 
 
