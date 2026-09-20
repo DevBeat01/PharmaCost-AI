@@ -2,6 +2,7 @@
 import chromadb
 import logging
 import json
+import uuid
 from pathlib import Path
 import sys
 
@@ -137,6 +138,80 @@ class VectorStore:
                 documents=texts,
                 metadatas=metadatas,
             )
+
+    @classmethod
+    def replace_documents_atomically(cls, documents: list[dict], on_promoted=None) -> int:
+        """Build a temporary collection, validate it, then swap it into service.
+
+        The current collection is renamed to a backup during the short swap and
+        restored if the temporary collection cannot be promoted.
+        """
+        global vector_store
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        embedding_function = cls._create_embedding_function()
+        token = uuid.uuid4().hex[:10]
+        temp_name = f"{_COLLECTION_NAME}_staging_{token}"
+        backup_name = f"{_COLLECTION_NAME}_backup_{token}"
+        staging = client.get_or_create_collection(
+            name=temp_name,
+            metadata={"hnsw:space": "cosine"},
+            embedding_function=embedding_function,
+        )
+        old = None
+        old_renamed = False
+        staging_promoted = False
+        try:
+            ids, texts, metadatas = [], [], []
+            for i, doc in enumerate(documents):
+                ids.append(f"{doc['source']}_{doc.get('chunk_index', i)}")
+                texts.append(doc["content"])
+                metadatas.append({
+                    "source": doc["source"],
+                    "doc_type": doc.get("doc_type", "general"),
+                    "chunk_index": doc.get("chunk_index", i),
+                })
+            if ids:
+                staging.add(ids=ids, documents=texts, metadatas=metadatas)
+            if staging.count() != len(documents):
+                raise RuntimeError(f"临时向量索引校验失败: 期望 {len(documents)}，实际 {staging.count()}")
+            try:
+                old = client.get_collection(_COLLECTION_NAME, embedding_function=embedding_function)
+            except Exception:
+                old = None
+            if old is not None:
+                old.modify(name=backup_name)
+                old_renamed = True
+            staging.modify(name=_COLLECTION_NAME)
+            staging_promoted = True
+            if client.get_collection(_COLLECTION_NAME, embedding_function=embedding_function).count() != len(documents):
+                raise RuntimeError("新向量索引上线后校验失败")
+            if on_promoted is not None:
+                on_promoted()
+            if old_renamed:
+                try:
+                    client.delete_collection(backup_name)
+                except Exception:
+                    logger.warning("上一版知识库备份集合清理失败: %s", backup_name, exc_info=True)
+            vector_store = None
+            return len(documents)
+        except Exception:
+            # If promotion failed after the old collection was renamed, restore it.
+            if staging_promoted:
+                try:
+                    client.delete_collection(_COLLECTION_NAME)
+                except Exception:
+                    pass
+            if old_renamed:
+                try:
+                    client.get_collection(backup_name, embedding_function=embedding_function).modify(name=_COLLECTION_NAME)
+                except Exception:
+                    logger.exception("恢复上一版知识库向量索引失败")
+            try:
+                client.delete_collection(temp_name)
+            except Exception:
+                pass
+            vector_store = None
+            raise
 
     def search(self, query: str, top_k: int = 5) -> list[dict]:
         """语义检索"""

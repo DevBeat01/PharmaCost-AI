@@ -19,9 +19,10 @@ class TaskGenerationRequest(BaseModel):
     """由分析模块提交已完成的归因结论，用于生成任务草稿。"""
     product: str = Field(min_length=1, max_length=100)
     month: str = Field(min_length=7, max_length=7)
-    analysis_scenario: Literal["dashboard_attribution", "benchmark_attribution"]
-    attribution_conclusion: str = Field(min_length=1, max_length=50000)
+    analysis_scenario: Literal["dashboard_attribution", "benchmark_attribution", "report_generated_tasks"]
+    attribution_conclusion: str = Field(default="", max_length=50000)
     analysis_evidence: dict[str, Any] = Field(default_factory=dict)
+    prebuilt_tasks: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
 
 
 class TaskDraftSaveRequest(BaseModel):
@@ -41,14 +42,26 @@ async def generate_tasks(payload: TaskGenerationRequest):
     """根据分析页面已展示的归因结论生成临时任务，等待用户选择保存。"""
     product = validate_product(payload.product)
     month = validate_month(payload.month)
+    conclusion = payload.attribution_conclusion.strip()
+    if payload.analysis_scenario == "report_generated_tasks":
+        if not payload.prebuilt_tasks:
+            raise HTTPException(422, "报告中没有可生成草稿的整改任务")
+        if not conclusion:
+            raise HTTPException(422, "报告整改任务缺少来源结论")
+    elif not conclusion:
+        raise HTTPException(422, "归因结论不能为空")
     from rpa.client import generate_task_drafts
-    return await generate_task_drafts(
-        product=product,
-        month=month,
-        analysis_scenario=payload.analysis_scenario,
-        attribution_conclusion=payload.attribution_conclusion.strip(),
-        analysis_evidence=payload.analysis_evidence,
-    )
+    try:
+        return await generate_task_drafts(
+            product=product,
+            month=month,
+            analysis_scenario=payload.analysis_scenario,
+            attribution_conclusion=conclusion,
+            analysis_evidence=payload.analysis_evidence,
+            prebuilt_tasks=payload.prebuilt_tasks,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
 
 
 @router.post("/save-drafts")

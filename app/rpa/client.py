@@ -28,10 +28,11 @@ RPA_STATUSES = {"draft", "sent", "received", "confirmed", "in_progress", "comple
 SCENARIO_NAMES = {
     "dashboard_attribution": "成本看板归因分析",
     "benchmark_attribution": "成本对标归因分析",
+    "report_generated_tasks": "报告整改任务清单",
 }
 
 # 任务标题必须能落到可核查的业务对象，避免把“加强管理”等口号直接派发。
-_TASK_ACTION_RE = re.compile(r"(核查|复核|比对|检查|确认|提取|汇总|分析|制定|建立|落实|整改|补充|验证|跟进|优化|共享|清理)")
+_TASK_ACTION_RE = re.compile(r"(核查|复核|比对|检查|确认|提取|调取|汇总|分析|制定|建立|落实|整改|补充|验证|跟进|优化|共享|清理)")
 _TASK_OBJECT_RE = re.compile(
     r"(采购|原材料|药材|供应商|报价|合同|入库价|领料单|投料|单耗|收率|工时|排班|加班|人员|"
     r"设备|能耗|维修|费用分摊|分摊表|成本明细|会计凭证|费用科目|产量|工艺参数|运行记录)"
@@ -127,7 +128,9 @@ def _normalize_task_instruction(item: dict) -> dict:
     return normalized
 
 
-def _filter_executable_tasks(items: list[dict], month: str) -> tuple[list[dict], int]:
+def _filter_executable_tasks(
+    items: list[dict], month: str, max_tasks: int = 3,
+) -> tuple[list[dict], int]:
     """清理模型输出，并将截止日规范为可执行的近期日期。"""
     accepted, seen, rejected = [], set(), 0
     for item in items:
@@ -141,8 +144,32 @@ def _filter_executable_tasks(items: list[dict], month: str) -> tuple[list[dict],
         seen.add(key)
         normalized["deadline"] = _valid_deadline(item.get("deadline"), month)
         accepted.append(normalized)
-        if len(accepted) == 3:
+        if len(accepted) >= max(1, max_tasks):
             break
+    return accepted, rejected
+
+
+def _normalize_report_task_candidates(
+    items: list[dict], month: str, max_tasks: int = 10,
+) -> tuple[list[dict], list[str]]:
+    """保真转换报告清单，避免通用关键词词库误删已展示的报告任务。"""
+    accepted, rejected, seen_ids = [], [], set()
+    for index, item in enumerate((items or [])[:max_tasks], 1):
+        if not isinstance(item, dict):
+            rejected.append(f"第{index}项不是任务对象")
+            continue
+        task_id = str(item.get("task_id") or "").strip()
+        if task_id and task_id in seen_ids:
+            rejected.append(f"第{index}项任务编号重复")
+            continue
+        if task_id:
+            seen_ids.add(task_id)
+        normalized = _normalize_task_instruction(item)
+        if len(normalized.get("task_title") or "") < 2:
+            rejected.append(f"第{index}项任务标题为空")
+            continue
+        normalized["deadline"] = _valid_deadline(item.get("deadline"), month)
+        accepted.append(normalized)
     return accepted, rejected
 
 
@@ -150,18 +177,43 @@ async def _request(method: str, path: str, **kwargs) -> dict:
     last_error = None
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.request(method, f"{RPA_BASE_URL}{path}", **kwargs)
+            # RPA 是本机服务，连接失败应快速反馈；过长的默认超时会让前端
+            # 在后端重试完成前先超时，用户看不到真实原因。
+            timeout = httpx.Timeout(connect=3.0, read=12.0, write=5.0, pool=3.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.request(method, f"{RPA_BASE_URL.rstrip('/')}{path}", **kwargs)
                 response.raise_for_status()
                 payload = response.json()
                 if isinstance(payload, dict) and payload.get("code") not in (None, 200):
                     raise RuntimeError(payload.get("message") or f"RPA业务错误: {payload.get('code')}")
                 return payload
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, RuntimeError) as exc:
+        except httpx.HTTPStatusError as exc:
+            detail = ""
+            try:
+                body = exc.response.json()
+                detail = body.get("detail") or body.get("message") or ""
+            except (ValueError, AttributeError):
+                pass
+            last_error = RuntimeError(
+                f"RPA接口返回 HTTP {exc.response.status_code}"
+                + (f"：{detail}" if detail else "")
+            )
+            if attempt < 2:
+                await asyncio.sleep(0.25 * (2 ** attempt))
+        except (httpx.TimeoutException, httpx.NetworkError, RuntimeError) as exc:
             last_error = exc
             if attempt < 2:
                 await asyncio.sleep(0.25 * (2 ** attempt))
     raise last_error or RuntimeError("RPA请求失败")
+
+
+def _dispatch_error_message(exc: Exception) -> str:
+    """将底层网络异常转换为前端可直接展示的处理提示。"""
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
+        return f"RPA服务未启动或无法连接（{RPA_BASE_URL.rstrip('/')}），请运行 start_rpa.bat 或 start_all.bat"
+    if isinstance(exc, httpx.TimeoutException):
+        return "RPA服务响应超时，请检查 RPA 服务窗口后重试"
+    return str(exc) or "RPA请求失败，请检查服务状态"
 
 
 async def send_rpa_task(task_data: dict) -> dict:
@@ -328,14 +380,19 @@ def _make_task_draft(
             "department": assignee["department"],
             "role": assignee["role"],
         }
+    source_payload = {
+        "analysis_scenario": source.get("analysis_scenario") or scenario,
+        "attribution_conclusion": source.get("attribution_conclusion") or conclusion,
+    }
+    # 报告任务的原始编号和单项结论用于追溯，但不替换系统生成的草稿编号。
+    for key in ("report_task_id", "report_source_conclusion"):
+        if str(source.get(key) or "").strip():
+            source_payload[key] = str(source[key]).strip()
     return {
         "task_id": f"TASK-{month}-{uuid.uuid4().hex[:10].upper()}",
         "task_title": item.get("task_title") or f"请检查{product}成本异常原因",
         "assignee": assignee,
-        "source": {
-            "analysis_scenario": source.get("analysis_scenario") or scenario,
-            "attribution_conclusion": source.get("attribution_conclusion") or conclusion,
-        },
+        "source": source_payload,
         "priority": _normalize_priority(item.get("priority", "medium")),
         "deadline": _valid_deadline(item.get("deadline"), month),
         "suggestion": item.get("suggestion", ""),
@@ -357,11 +414,45 @@ async def generate_task_drafts(
     analysis_scenario: str,
     attribution_conclusion: str,
     analysis_evidence: dict | None = None,
+    prebuilt_tasks: list[dict] | None = None,
 ) -> dict:
     """根据分析页已展示的归因结论生成临时任务，不重新执行分析、不触发RPA。"""
     scenario = SCENARIO_NAMES[analysis_scenario]
     conclusion = attribution_conclusion.strip()
     evidence = dict(analysis_evidence or {})
+    # 报告入口只能消费本次报告已经生成并展示的任务清单。这里故意不调用
+    # LLM、也不从报告长文本或规则重新推导，确保用户审阅的是报告原有结论。
+    if analysis_scenario == "report_generated_tasks":
+        submitted_tasks = len(prebuilt_tasks or [])
+        # 报告 Word 表和预览中的清单已经是用户可见的唯一任务依据。这里仅做
+        # 结构、编号和基础字段校验，不再套用看板/对标专用的关键词白名单。
+        generated, rejection_reasons = _normalize_report_task_candidates(
+            prebuilt_tasks or [], month, max_tasks=10,
+        )
+        rejected_tasks = len(rejection_reasons)
+        if not generated:
+            raise ValueError("报告整改任务清单中没有有效的结构化任务")
+        for item in generated:
+            assignee = item.get("assignee") if isinstance(item.get("assignee"), dict) else {}
+            if not all(str(assignee.get(key) or "").strip() for key in ("name", "department", "role")):
+                item["assignee"] = _determine_assignee(str(item.get("task_title") or ""))
+            raw_source = item.get("source") if isinstance(item.get("source"), dict) else {}
+            item["source"] = {
+                "analysis_scenario": scenario,
+                "attribution_conclusion": conclusion,
+                "report_task_id": str(item.get("task_id") or "").strip(),
+                "report_source_conclusion": str(
+                    raw_source.get("finding") or raw_source.get("attribution_conclusion") or ""
+                ).strip(),
+            }
+        drafts = [_make_task_draft(product, month, item, scenario, conclusion, evidence) for item in generated]
+        return {
+            "product": product, "month": month, "submitted_tasks": submitted_tasks,
+            "tasks_generated": len(drafts), "generation_source": "report_task_candidates",
+            "rejected_tasks": rejected_tasks, "rejection_reasons": rejection_reasons,
+            "tasks": drafts,
+        }
+
     # 两类分析场景都优先调用 AI；结构化建议仅作为模型不可用时的备用来源。
     generated = []
     rejected_tasks = 0
@@ -400,6 +491,7 @@ async def generate_task_drafts(
 async def save_selected_task_drafts(tasks: list[dict]) -> dict:
     """仅保存用户在审阅弹窗中明确勾选的任务草稿。"""
     saved = []
+    report_task_ids = set()
     for item in tasks[:20]:
         if not isinstance(item, dict):
             continue
@@ -411,7 +503,18 @@ async def save_selected_task_drafts(tasks: list[dict]) -> dict:
         if not product or not month or not conclusion or not item.get("task_title"):
             continue
         item = _normalize_task_instruction(item)
-        if not _is_executable_task(item):
+        is_report_task = scenario == SCENARIO_NAMES["report_generated_tasks"]
+        report_task_id = str(source.get("report_task_id") or "").strip()
+        if is_report_task and report_task_id in report_task_ids:
+            logger.warning("拒绝保存重复的报告整改任务: %s", report_task_id)
+            continue
+        if is_report_task:
+            if len(item.get("task_title") or "") < 2:
+                logger.warning("拒绝保存空标题的报告整改任务")
+                continue
+            if report_task_id:
+                report_task_ids.add(report_task_id)
+        elif not _is_executable_task(item):
             logger.warning("拒绝保存不可执行的整改任务: %s", item.get("task_title"))
             continue
         draft = _make_task_draft(
@@ -476,7 +579,7 @@ async def dispatch_selected_tasks(task_ids: list[str]) -> dict:
             results.append({
                 "task_id": task_id,
                 "status": "draft",
-                "error": "本次未发送成功，任务已恢复为待派发，请检查后重试",
+                "error": f"{_dispatch_error_message(exc)}；任务已恢复为待派发，请检查后重试",
                 "retryable": True,
             })
 

@@ -16,6 +16,10 @@ from config import ALERT_THRESHOLD
 logger = logging.getLogger("analysis.dashboard")
 
 _RAG_TIMEOUT_SECONDS = 4.0
+_PRIMARY_LLM_FIRST_CHUNK_TIMEOUT_SECONDS = 45.0
+_BACKUP_LLM_FIRST_CHUNK_TIMEOUT_SECONDS = 45.0
+_PRIMARY_LLM_TEXT_TIMEOUT_SECONDS = 60.0
+_BACKUP_LLM_TEXT_TIMEOUT_SECONDS = 45.0
 # Some OpenAI-compatible models take over 45 seconds to produce the first
 # token for the large dashboard context. Keep the server below the browser's
 # 120-second SSE deadline, while retaining a finite failure boundary.
@@ -517,23 +521,33 @@ def dashboard_attribution(product: str, month: str, force: bool = False) -> dict
             for index, result in enumerate(rag_results)
         )
         source = 'fallback'
+        text = ''
         try:
             from llm.prompts import DASHBOARD_ATTRIBUTION_PROMPT, SYSTEM_ROLE
-            text = _model_text_with_timeout(
-                DASHBOARD_ATTRIBUTION_PROMPT.format(
-                    product=product,
-                    month=month,
-                    context=json.dumps(context, ensure_ascii=False, indent=2),
-                    rag_context=rag_context or '知识库检索正在初始化或本次未检索到匹配片段；不得因此停止归因，请先基于看板数据生成分析，待核查事项明确标注。',
-                ),
-                SYSTEM_ROLE,
-                _LLM_STREAM_TIMEOUT_SECONDS,
-                max_tokens=_ATTRIBUTION_MAX_TOKENS,
+            prompt = DASHBOARD_ATTRIBUTION_PROMPT.format(
+                product=product,
+                month=month,
+                context=json.dumps(context, ensure_ascii=False, indent=2),
+                rag_context=rag_context or '知识库检索正在初始化或本次未检索到匹配片段；不得因此停止归因，请先基于看板数据生成分析，待核查事项明确标注。',
             )
-            if text and str(text).strip():
-                source = 'ai'
-        except Exception:
-            text = fallback
+            for provider, provider_timeout in (
+                ('deepseek', _PRIMARY_LLM_TEXT_TIMEOUT_SECONDS),
+                ('mimo', _BACKUP_LLM_TEXT_TIMEOUT_SECONDS),
+            ):
+                try:
+                    text = _model_text_with_timeout(
+                        prompt, SYSTEM_ROLE, provider_timeout,
+                        max_tokens=_ATTRIBUTION_MAX_TOKENS, provider=provider,
+                    )
+                    if text and str(text).strip():
+                        source = 'ai'
+                        break
+                except Exception as exc:
+                    logger.warning("归因%s模型不可用，将尝试下一兜底: product=%s month=%s error=%s", provider, product, month, exc)
+                    text = ''
+        except Exception as exc:
+            logger.warning("归因模型调用失败，使用规则兜底: product=%s month=%s error=%s", product, month, exc)
+            text = ''
         text = text or fallback
         used_rag_sources = rag_sources if source == 'ai' else []
         if used_rag_sources:
@@ -647,31 +661,72 @@ def dashboard_attribution_stream(product: str, month: str, force: bool = False):
                 context=json.dumps(context, ensure_ascii=False, indent=2),
                 rag_context=rag_context or '知识库检索正在初始化或本次未检索到匹配片段；不得因此停止归因，请先基于看板数据生成分析，待核查事项明确标注。',
             )
-            # Consume the provider's real streaming response. Each model
-            # delta is forwarded immediately; the timeout guard prevents a
-            # stalled upstream iterator from keeping the SSE request open.
-            for chunk in _model_stream_with_timeout(
-                prompt, SYSTEM_ROLE, _LLM_STREAM_TIMEOUT_SECONDS, max_tokens=_ATTRIBUTION_MAX_TOKENS
+            # 主模型在首个正文分片前失败或超时，立即切换 MiMo；两者都
+            # 不能完成时才使用规则归因。主模型的半截文本不能与备用模型
+            # 续写混用；备用模型产生首个分片时会整体替换该半截文本。
+            replace_primary_partial = False
+            for provider, first_chunk_timeout, total_timeout in (
+                ('deepseek', _PRIMARY_LLM_FIRST_CHUNK_TIMEOUT_SECONDS, _PRIMARY_LLM_TEXT_TIMEOUT_SECONDS),
+                ('mimo', _BACKUP_LLM_FIRST_CHUNK_TIMEOUT_SECONDS, _BACKUP_LLM_TEXT_TIMEOUT_SECONDS),
             ):
-                if chunk:
-                    text += str(chunk)
-                    streamed_text = True
-                    yield {'event': 'chunk', 'data': {'text': str(chunk)}}
-            if not text.strip():
-                raise RuntimeError('模型未返回归因文本')
-            source = 'ai'
-        except Exception as exc:
-            # A provider can time out after it has already streamed useful
-            # prose. Keep that model text visible instead of replacing it
-            # with a generic fallback document.
-            if streamed_text and text.strip():
-                logger.warning("归因模型流式未完成，保留已生成内容: product=%s month=%s error=%s", product, month, exc)
-                source = 'ai_partial'
-            else:
-                logger.warning("归因模型调用失败，使用规则兜底: product=%s month=%s error=%s", product, month, exc)
+                attempt_text = ''
+                try:
+                    yield {'event': 'status', 'data': {'provider': provider, 'phase': 'generating', 'message': f'{"主模型" if provider == "deepseek" else "备用模型"}正在生成'}}
+                    started_at = time.monotonic()
+                    first_activity_at = None
+                    first_content_at = None
+                    for chunk in _model_stream_with_timeout(
+                        prompt, SYSTEM_ROLE, total_timeout,
+                        max_tokens=_ATTRIBUTION_MAX_TOKENS,
+                        provider=provider,
+                        first_chunk_timeout=first_chunk_timeout,
+                    ):
+                        if isinstance(chunk, tuple):
+                            kind, value = chunk
+                            if kind == 'activity':
+                                if first_activity_at is None:
+                                    first_activity_at = time.monotonic()
+                                    logger.info("归因%s模型首个推理分片: %.2fs", provider, first_activity_at - started_at)
+                                yield {'event': 'status', 'data': {'provider': provider, 'phase': 'thinking', 'message': f'{"主模型" if provider == "deepseek" else "备用模型"}正在深度思考'}}
+                                continue
+                            chunk = value
+                        if chunk:
+                            if first_content_at is None:
+                                first_content_at = time.monotonic()
+                                logger.info("归因%s模型首个正文分片: %.2fs", provider, first_content_at - started_at)
+                            if replace_primary_partial:
+                                text = ''
+                                streamed_text = False
+                                replace_primary_partial = False
+                                yield {'event': 'replace', 'data': {'text': ''}}
+                            attempt_text += str(chunk)
+                            text += str(chunk)
+                            streamed_text = True
+                            yield {'event': 'chunk', 'data': {'text': str(chunk)}}
+                    if not attempt_text.strip():
+                        raise RuntimeError(f'{provider} 未返回归因文本')
+                    source = 'ai'
+                    logger.info("归因%s模型完成: %.2fs", provider, time.monotonic() - started_at)
+                    break
+                except Exception as exc:
+                    if attempt_text.strip():
+                        logger.warning("归因%s模型流式未完成，将尝试下一兜底: product=%s month=%s error=%s", provider, product, month, exc)
+                        if provider == 'deepseek':
+                            yield {'event': 'status', 'data': {'provider': 'deepseek', 'phase': 'fallback', 'message': '主模型响应超时，正在切换备用模型'}}
+                            replace_primary_partial = True
+                            continue
+                    logger.warning("归因%s模型不可用，将尝试下一兜底: product=%s month=%s error=%s", provider, product, month, exc)
+                    if provider == 'deepseek':
+                        yield {'event': 'status', 'data': {'provider': 'deepseek', 'phase': 'fallback', 'message': '主模型响应超时，正在切换备用模型'}}
+            if source == 'fallback':
                 model_failed = True
                 text = fallback
-                source = 'fallback'
+                yield {'event': 'status', 'data': {'provider': 'rules', 'phase': 'fallback', 'message': '模型均不可用，已切换规则分析'}}
+        except Exception as exc:
+            logger.warning("归因模型调用失败，使用规则兜底: product=%s month=%s error=%s", product, month, exc)
+            model_failed = True
+            text = fallback
+            source = 'fallback'
         text = text or fallback
         used_rag_sources = rag_sources if source == 'ai' else []
         text = _append_rag_sources(text, used_rag_sources, rag_results) if used_rag_sources else _append_data_only_notice(text)
@@ -707,49 +762,77 @@ def _run_with_timeout(fn, timeout: float, default):
         return default
 
 
-def _model_stream_with_timeout(prompt: str, system: str, timeout: float, max_tokens: int = 1800):
-    """消费LLM流式响应并设置总超时，避免SSE连接无限等待。"""
+def _model_stream_with_timeout(
+    prompt: str, system: str, timeout: float, max_tokens: int = 1800,
+    provider: str | None = None, first_chunk_timeout: float | None = None,
+):
+    """消费一个模型的流式响应，并设置总时限与首正文分片时限。"""
     # Do not use a bounded queue here. A fast provider can emit more than 128
     # deltas before the ASGI response gets scheduled; dropping the terminal
     # ``done`` marker would make the consumer wait until the hard timeout.
     result_queue = queue.Queue()
+    cancel_event = threading.Event()
 
     def worker():
         try:
             from llm.client import llm_client
-            for chunk in llm_client.chat_stream(prompt, system=system, max_tokens=max_tokens):
+            stream = (
+                llm_client.chat_stream_provider(
+                    provider, prompt, system=system, max_tokens=max_tokens,
+                    include_reasoning=True, cancel_event=cancel_event,
+                )
+                if provider else llm_client.chat_stream(prompt, system=system, max_tokens=max_tokens)
+            )
+            for chunk in stream:
                 if chunk:
-                    result_queue.put(('chunk', str(chunk)))
+                    result_queue.put(('chunk', chunk if isinstance(chunk, tuple) or provider else str(chunk)))
             result_queue.put(('done', None))
         except Exception as exc:
             result_queue.put(('error', exc))
 
     threading.Thread(target=worker, daemon=True, name="dashboard-attribution-llm").start()
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"模型流式调用超过{timeout:.0f}秒")
-        try:
-            kind, value = result_queue.get(timeout=min(0.5, remaining))
-        except queue.Empty:
-            continue
-        if kind == 'chunk':
-            yield value
-        elif kind == 'done':
-            return
-        else:
-            raise value
+    started_at = time.monotonic()
+    deadline = started_at + timeout
+    received_first_chunk = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"模型流式调用超过{timeout:.0f}秒")
+            if not received_first_chunk and first_chunk_timeout is not None:
+                first_remaining = started_at + first_chunk_timeout - time.monotonic()
+                if first_remaining <= 0:
+                    raise TimeoutError(f"模型首个正文分片/事件超过{first_chunk_timeout:.0f}秒")
+                remaining = min(remaining, first_remaining)
+            try:
+                kind, value = result_queue.get(timeout=min(0.5, remaining))
+            except queue.Empty:
+                continue
+            if kind == 'chunk':
+                received_first_chunk = True
+                yield value
+            elif kind == 'done':
+                return
+            else:
+                raise value
+    finally:
+        cancel_event.set()
 
 
-def _model_text_with_timeout(prompt: str, system: str, timeout: float, max_tokens: int = 1800) -> str:
+def _model_text_with_timeout(
+    prompt: str, system: str, timeout: float, max_tokens: int = 1800, provider: str | None = None,
+) -> str:
     """Call the complete-text API with a hard wall-clock timeout."""
     result_queue = queue.Queue(maxsize=1)
 
     def worker():
         try:
             from llm.client import llm_client
-            result_queue.put((True, str(llm_client.chat(prompt, system=system, max_tokens=max_tokens) or "")), block=False)
+            text = (
+                llm_client.chat_provider(provider, prompt, system=system, max_tokens=max_tokens)
+                if provider else llm_client.chat(prompt, system=system, max_tokens=max_tokens)
+            )
+            result_queue.put((True, str(text or "")), block=False)
         except Exception as exc:
             try:
                 result_queue.put((False, exc), block=False)

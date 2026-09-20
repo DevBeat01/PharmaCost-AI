@@ -66,7 +66,12 @@
                 const resp = await fetch(url, { ...fetchOptions, signal: controller.signal });
                 if (!resp.ok) {
                     if (resp.status === 401 && window.Auth) window.Auth.handleUnauthorized();
-                    throw new Error(`HTTP ${resp.status}`);
+                    let detail = '';
+                    try {
+                        const payload = await resp.json();
+                        detail = payload.detail || payload.message || '';
+                    } catch (_) { /* 非 JSON 错误响应 */ }
+                    throw new Error(detail || `HTTP ${resp.status}`);
                 }
                 return await resp.json();
             } catch (e) {
@@ -294,6 +299,61 @@
                 .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
                 .join('&');
         }
+    };
+
+    /* ============ 全局站内确认/提示弹窗 ============ */
+    const AppDialog = {
+        _finishActive: null,
+
+        confirm(options = {}) {
+            return this.open({ ...options, showCancel: true, danger: options.danger !== false });
+        },
+
+        alert(options = {}) {
+            return this.open({ ...options, showCancel: false, danger: Boolean(options.danger) });
+        },
+
+        open(options = {}) {
+            if (this._finishActive) this._finishActive(false);
+            const previousFocus = document.activeElement;
+            const esc = value => Utils.escapeHtml(value ?? '');
+            const backdrop = document.createElement('div');
+            backdrop.id = 'appActionDialog';
+            backdrop.className = 'settings-action-dialog-backdrop';
+            backdrop.innerHTML = `<section class="settings-action-dialog" role="alertdialog" aria-modal="true" aria-labelledby="appActionDialogTitle">
+                <div class="settings-action-dialog-icon ${options.danger ? 'danger' : ''}"><i data-lucide="${esc(options.icon || (options.danger ? 'triangle-alert' : 'circle-info'))}"></i></div>
+                <div class="settings-action-dialog-content"><h3 id="appActionDialogTitle">${esc(options.title || '提示')}</h3><p>${esc(options.message || '')}</p>${options.detail ? `<small>${esc(options.detail)}</small>` : ''}</div>
+                <div class="settings-action-dialog-actions">
+                    ${options.showCancel ? '<button type="button" class="btn btn-outline" data-app-dialog-cancel>取消</button>' : ''}
+                    <button type="button" class="btn ${options.danger ? 'btn-danger' : 'btn-primary'}" data-app-dialog-confirm>${esc(options.confirmText || (options.showCancel ? '确认' : '知道了'))}</button>
+                </div>
+            </section>`;
+            document.body.appendChild(backdrop);
+
+            return new Promise(resolve => {
+                let settled = false;
+                const finish = value => {
+                    if (settled) return;
+                    settled = true;
+                    document.removeEventListener('keydown', onKey);
+                    backdrop.remove();
+                    this._finishActive = null;
+                    if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+                    resolve(value);
+                };
+                const onKey = event => {
+                    if (event.key === 'Escape') finish(false);
+                    if (event.key === 'Enter') finish(true);
+                };
+                this._finishActive = finish;
+                document.addEventListener('keydown', onKey);
+                backdrop.querySelector('[data-app-dialog-cancel]')?.addEventListener('click', () => finish(false));
+                backdrop.querySelector('[data-app-dialog-confirm]')?.addEventListener('click', () => finish(true));
+                backdrop.addEventListener('click', event => { if (event.target === backdrop) finish(false); });
+                if (typeof refreshIcons === 'function') refreshIcons();
+                (backdrop.querySelector('[data-app-dialog-cancel]') || backdrop.querySelector('[data-app-dialog-confirm]'))?.focus();
+            });
+        },
     };
 
     /* ============ SVG 图标库（GMP工业线条风格，24x24 viewBox） ============ */
@@ -591,6 +651,7 @@
     /* ============ 暴露到全局 ============ */
     window.AppState = AppState;
     window.Utils = Utils;
+    window.AppDialog = AppDialog;
     window.Router = Router;
     window.Selectors = Selectors;
     window.Icons = Icons;

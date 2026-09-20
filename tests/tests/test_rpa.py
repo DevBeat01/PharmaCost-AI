@@ -144,6 +144,133 @@ def test_task_without_llm_deliverable_gets_a_verifiable_expected_result():
     assert client._is_executable_task(generated[0])
 
 
+def test_report_task_candidates_do_not_call_llm_or_generate_fallback_tasks():
+    async def run():
+        candidates = [{
+            "task_title": "核查金银花采购入库价与合同单价差异",
+            "assignee": {"name": "张伟", "department": "采购部", "role": "采购经理"},
+            "priority": "high",
+            "deadline": "2026-07-20",
+            "expected_result": "输出采购入库价与合同单价差异核查表，并提交整改措施。",
+            "source": {"finding": "材料成本高于预算"},
+        }]
+        with patch.object(client, "_generate_llm_tasks", new_callable=AsyncMock) as generate:
+            result = await client.generate_task_drafts(
+                "银黄口服液", "2026-06", "report_generated_tasks", "材料成本高于预算",
+                {"source": "报告整改任务清单"}, candidates,
+            )
+        assert generate.await_count == 0
+        assert result["generation_source"] == "report_task_candidates"
+        assert result["tasks_generated"] == 1
+        assert result["tasks"][0]["source"]["analysis_scenario"] == "报告整改任务清单"
+        assert result["tasks"][0]["task_title"] == candidates[0]["task_title"]
+
+    with_temporary_store(lambda _: asyncio.run(run()))
+
+
+def test_report_task_candidates_reject_only_invalid_structure():
+    async def run():
+        try:
+            await client.generate_task_drafts(
+                "银黄口服液", "2026-06", "report_generated_tasks", "报告结论",
+                {}, [{"task_id": "RPT-1", "task_title": ""}],
+            )
+        except ValueError as exc:
+            assert "没有有效的结构化任务" in str(exc)
+            return
+        raise AssertionError("report task without a title should be rejected")
+
+    with_temporary_store(lambda _: asyncio.run(run()))
+
+
+def test_report_task_candidates_keep_all_valid_report_tasks_not_generic_three_task_limit():
+    async def run():
+        candidates = [
+            {
+                "task_title": f"核查原材料采购入库价与合同单价差异第{index}项",
+                "assignee": {"name": "张伟", "department": "采购部", "role": "采购经理"},
+                "priority": "medium",
+                "deadline": "2026-07-20",
+                "expected_result": "输出采购入库价与合同单价差异核查表，并提交整改措施。",
+            }
+            for index in range(1, 6)
+        ]
+        result = await client.generate_task_drafts(
+            "银黄口服液", "2026-06", "report_generated_tasks", "材料成本存在差异", {}, candidates,
+        )
+        assert result["tasks_generated"] == len(candidates)
+        assert [item["task_title"] for item in result["tasks"]] == [item["task_title"] for item in candidates]
+
+    with_temporary_store(lambda _: asyncio.run(run()))
+
+
+def test_report_task_candidates_accept_actionable_data_retrieval_task():
+    """报告中的“调取 BOM 与采购订单”是明确核查动作，不能被词库误删。"""
+    async def run():
+        candidate = {
+            "task_title": "调取一厂与二厂2026年7月BOM用量及采购订单差异数据",
+            "assignee": {"name": "周财务", "department": "财务部", "role": "管理会计"},
+            "priority": "medium",
+            "deadline": "2026-08-31",
+            "expected_result": "输出两厂BOM用量与采购订单差异对比表，并提交差异根因分析报告。",
+        }
+        result = await client.generate_task_drafts(
+            "六味地黄胶囊", "2026-07", "report_generated_tasks", "材料成本差异需核查", {}, [candidate],
+        )
+        assert result["tasks_generated"] == 1
+        assert result["tasks"][0]["task_title"] == candidate["task_title"]
+
+    with_temporary_store(lambda _: asyncio.run(run()))
+
+
+def test_report_tasks_preserve_all_eight_candidates_and_save_them_without_keyword_filtering():
+    """报告清单中的产能、订单、工资任务不应被看板场景词库过滤。"""
+    async def run():
+        titles = [
+            "核查山茱萸库存量并制定8月底前3个月用量锁价采购方案",
+            "核查空心胶囊供应商报价单及合同变更记录并启动替代供应商认证",
+            "建立产量-固定费用联动监控机制并设定月度产量预警线",
+            "核查一厂与二厂直接材料成本差异并统一采购与投料标准",
+            "评估二厂产能负荷并制定订单调配方案提升产能利用率至90%以上",
+            "建立六味地黄胶囊配方药材价格监测台账并设定预警阈值",
+            "核查7月间接人工工资明细及高温补贴发放合理性",
+            "建立胶囊填充机等关键设备全生命周期成本台账及预防性维护计划",
+        ]
+        candidates = [
+            {"task_id": f"TASK-202607-{index:04d}", "task_title": title, "priority": "medium"}
+            for index, title in enumerate(titles, 1)
+        ]
+        result = await client.generate_task_drafts(
+            "六味地黄胶囊", "2026-07", "report_generated_tasks", "报告整改任务结论", {}, candidates,
+        )
+        assert result["submitted_tasks"] == 8
+        assert result["tasks_generated"] == 8
+        assert result["rejected_tasks"] == 0
+        assert [task["task_title"] for task in result["tasks"]] == titles
+        assert result["tasks"][4]["source"]["report_task_id"] == "TASK-202607-0005"
+        saved = await client.save_selected_task_drafts(result["tasks"])
+        assert saved["tasks_saved"] == 8
+        assert len(client.TASK_STORE.list()) == 8
+
+    with_temporary_store(lambda _: asyncio.run(run()))
+
+
+def test_report_task_candidates_reject_duplicate_source_task_id_with_reason():
+    async def run():
+        result = await client.generate_task_drafts(
+            "银黄口服液", "2026-06", "report_generated_tasks", "报告结论", {}, [
+                {"task_id": "RPT-001", "task_title": "核查采购订单差异"},
+                {"task_id": "RPT-001", "task_title": "核查人工工资差异"},
+            ],
+        )
+        assert result["submitted_tasks"] == 2
+        assert result["tasks_generated"] == 1
+        assert result["rejected_tasks"] == 1
+        assert result["rejection_reasons"] == ["第2项任务编号重复"]
+
+    with_temporary_store(lambda _: asyncio.run(run()))
+
+
 def test_only_selected_draft_is_dispatched_without_wechat_notification():
     async def fake_rpa(task):
         return {"code": 200, "data": {"task_id": task["task_id"], "status": "sent"}}

@@ -20,7 +20,9 @@
 import json          # JSON 序列化/反序列化，用于读写历史记录文件
 import logging       # Python 内置日志模块，用于记录运行信息和错误
 import os
+import statistics
 import tempfile
+import threading
 import time          # 时间模块，用于获取时间戳、格式化时间
 import uuid          # UUID 模块，用于生成唯一的任务 ID
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +48,7 @@ from fastapi.responses import FileResponse
 
 from security import validate_month, validate_product, validate_task_id
 from report.task_store import ReportTaskStore
+from resources.manager import resource_manager
 # 从 security 模块导入输入校验函数
 # 这些函数会对用户输入做安全检查（如防止注入攻击、非法字符等）
 
@@ -70,7 +73,7 @@ _tasks: dict = {}
 # 类型标注 dict 表示这个变量是字典类型（Python 3.6+ 类型提示）
 
 _TASK_TTL = 3600 * 24 * 30
-REPORT_HISTORY_MAX_RECORDS = int(os.getenv("REPORT_HISTORY_MAX_RECORDS", "20"))
+REPORT_HISTORY_MAX_RECORDS = 0  # 保留兼容名称；历史报告不再按条数自动删除。
 # 【任务在内存中的存活时间】单位：秒
 # 3600秒(1小时) × 24小时 × 30天 = 30天
 # 超过这个时间的任务会从内存中自动清除，释放内存
@@ -86,6 +89,8 @@ _TASK_DB_PATH = Path(os.getenv(
 ))
 _TASK_STORE = ReportTaskStore(_TASK_DB_PATH)
 _REPORT_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("REPORT_WORKERS", "2"))))
+_REPORT_CANCELLED: set[str] = set()
+_REPORT_LOCK = threading.RLock()
 # 【历史记录文件路径】
 # Path(__file__)           : 当前文件的路径（app/routers/report.py）
 # .resolve()               : 转为绝对路径
@@ -156,15 +161,6 @@ def _delete_task_files(task):
 
 
 def _save_history(records):
-    kept_records = records[-REPORT_HISTORY_MAX_RECORDS:] if REPORT_HISTORY_MAX_RECORDS else []
-    for record in records[:-REPORT_HISTORY_MAX_RECORDS] if REPORT_HISTORY_MAX_RECORDS else records:
-        if isinstance(record, dict):
-            _delete_task_files(record)
-            task_id = record.get("task_id")
-            if task_id:
-                _tasks.pop(task_id, None)
-                _TASK_STORE.delete(task_id)
-
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -175,7 +171,7 @@ def _save_history(records):
             suffix=".tmp",
             delete=False,
         ) as temp_file:
-            json.dump(kept_records, temp_file, ensure_ascii=False, indent=2)
+            json.dump(records, temp_file, ensure_ascii=False, indent=2)
             temp_path = Path(temp_file.name)
         os.replace(temp_path, _HISTORY_PATH)
     finally:
@@ -288,11 +284,47 @@ def _find_task(task_id: str) -> dict | None:
     return task
 
 
+def _estimate_report_seconds() -> int:
+    """Estimate total report time from recent completed tasks."""
+    durations = []
+    try:
+        for record in _TASK_STORE.list(limit=20, completed_only=True):
+            value = float(record.get("duration_seconds", 0) or 0)
+            if 5 <= value <= 900:
+                durations.append(value)
+    except Exception:
+        logger.debug("读取报告历史耗时失败", exc_info=True)
+    if not durations:
+        return 60
+    return max(15, min(900, round(statistics.median(durations))))
+
+
+def _template_for_task(template_id: str | None) -> str | None:
+    if not template_id:
+        return None
+    resource = resource_manager.get(template_id)
+    if not resource or resource.get("resource_type") != "template":
+        raise ValueError("报告模板不存在")
+    if resource.get("status") != "active" or not Path(resource.get("path", "")).is_file():
+        raise ValueError("报告模板当前不可用")
+    return str(resource["path"])
+
+
 def _run_report_task(task: dict) -> None:
     """Execute the existing engine off the event loop and persist every state."""
-    task.update({"status": "generating", "progress": 50})
-    _save_task(task)
     task_id = task["task_id"]
+    # Cancellation may arrive after the task is queued but before the worker
+    # starts. Check before persisting a generating state so a cancelled task
+    # cannot be resurrected in memory or SQLite.
+    with _REPORT_LOCK:
+        if task_id in _REPORT_CANCELLED:
+            _REPORT_CANCELLED.discard(task_id)
+            return
+        task.update({
+            "status": "generating", "progress": 50,
+            "started_at": _now_text(), "_started_epoch": time.time(),
+        })
+        _save_task(task)
     try:
         from report.engine import ReportEngine
         from report.pdf_export import export_pdf
@@ -304,24 +336,57 @@ def _run_report_task(task: dict) -> None:
         pdf_path = _resolve_output_path(OUTPUT_DIR / f"{stem}.pdf")
         if not docx_path or not pdf_path:
             raise RuntimeError("报告输出路径无效")
-        preview = ReportEngine().generate(task["product"], task["month"], str(docx_path), report_type=task["report_type"])
-        export_pdf(preview, str(pdf_path), str(docx_path))
-        task.update({
-            "status": "completed", "progress": 100,
-            "docx_path": str(docx_path), "pdf_path": str(pdf_path),
-            "preview": {key: value for key, value in preview.items() if key != "placeholders"},
-            "completed_at": _now_text(), "created_at": task.get("created_at") or _now_text(),
-        })
-        _save_task(task)
-        # Keep the legacy JSON export synchronized for existing consumers.
-        history = [item for item in _load_history() if item.get("task_id") != task_id]
-        history.append(_public_task(task))
-        _save_history(history)
+        template_path = _template_for_task(task.get("template_id"))
+        if template_path:
+            preview = ReportEngine().generate(
+                task["product"], task["month"], str(docx_path),
+                report_type=task["report_type"], template_path=template_path,
+            )
+        else:
+            # Preserve compatibility with lightweight test/demonstration
+            # engines that implement the original three-argument contract.
+            preview = ReportEngine().generate(
+                task["product"], task["month"], str(docx_path),
+                report_type=task["report_type"],
+            )
+        pdf_error = ""
+        try:
+            export_pdf(preview, str(pdf_path), str(docx_path))
+        except Exception as error:
+            # PDF is a secondary export. A missing Word/reportlab converter
+            # must not discard a successfully generated DOCX and preview.
+            pdf_error = str(error)
+            logger.warning("PDF 导出不可用，保留 Word 报告: %s", error)
+        with _REPORT_LOCK:
+            if task_id in _REPORT_CANCELLED:
+                _delete_task_files({"docx_path": str(docx_path), "pdf_path": str(pdf_path)})
+                _REPORT_CANCELLED.discard(task_id)
+                return
+            task.update({
+                "status": "completed", "progress": 100,
+                "docx_path": str(docx_path), "pdf_path": str(pdf_path),
+                "preview": {key: value for key, value in preview.items() if key != "placeholders"},
+                "completed_at": _now_text(), "created_at": task.get("created_at") or _now_text(),
+                "duration_seconds": round(time.time() - task.get("_created", time.time()), 1),
+            })
+            if not pdf_path.exists():
+                task["pdf_path"] = ""
+            if pdf_error:
+                task["pdf_error"] = "PDF导出不可用，请安装 reportlab 或配置 Word"
+            _save_task(task)
+            # Keep the legacy JSON export synchronized for existing consumers.
+            history = [item for item in _load_history() if item.get("task_id") != task_id]
+            history.append(_public_task(task))
+            _save_history(history)
         logger.info("报告生成成功: %s", task_id)
     except Exception:
-        logger.error("报告生成失败: %s", task_id, exc_info=True)
-        task.update({"status": "failed", "progress": 100, "error": "报告生成失败,请稍后重试或联系管理员"})
-        _save_task(task)
+        with _REPORT_LOCK:
+            if task_id in _REPORT_CANCELLED:
+                _REPORT_CANCELLED.discard(task_id)
+                return
+            logger.error("报告生成失败: %s", task_id, exc_info=True)
+            task.update({"status": "failed", "progress": 100, "error": "报告生成失败,请稍后重试或联系管理员"})
+            _save_task(task)
 
 
 # ============================================================
@@ -350,6 +415,8 @@ async def generate_report(
 
     output_format: str = Query("docx"),
     # 例: ?output_format=pdf
+
+    template_id: str | None = Query(None),
 ):
     """
     生成药品成本分析报告。
@@ -378,6 +445,15 @@ async def generate_report(
     month = validate_month(month)        # 校验月份格式（如 2026-06）
     report_type = _validate_report_type(report_type)
     output_format = _validate_output_format(output_format)
+    if template_id:
+        resource = resource_manager.get(template_id)
+        if not resource or resource.get("resource_type") != "template":
+            raise HTTPException(status_code=404, detail="报告模板不存在")
+        if resource.get("status") != "active" or not Path(resource.get("path", "")).is_file():
+            raise HTTPException(status_code=409, detail="报告模板当前不可用")
+        tagged_type = str(resource.get("metadata", {}).get("report_type") or "")
+        if tagged_type in {"monthly", "quarterly", "topic"}:
+            report_type = tagged_type
 
     # Queue the expensive engine/export work on a bounded worker pool. The
     # legacy synchronous implementation below is retained for source-level
@@ -388,7 +464,9 @@ async def generate_report(
     task = {
         "task_id": task_id, "status": "queued", "product": product, "month": month,
         "report_type": report_type, "output_format": output_format,
-        "created_at": now, "updated_at": now, "progress": 0, "_created": time.time(),
+        "template_id": template_id,
+        "created_at": now, "updated_at": now, "progress": 0,
+        "estimate_seconds": _estimate_report_seconds(), "_created": time.time(),
     }
     _save_task(task)
     _REPORT_EXECUTOR.submit(_run_report_task, task)
@@ -509,7 +587,9 @@ async def generate_report(
 # GET 请求，用于查询数据（不修改任何东西）
 
 async def report_history(
-    limit: int = Query(20, ge=1, le=100)
+    limit: int | None = Query(None, ge=1, le=100),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=5, le=100),
     # ge = greater or equal（最小值）
     # le = less or equal（最大值）
     # 即 limit 只能是 1~100 之间的整数，默认 20
@@ -525,12 +605,28 @@ async def report_history(
       - reversed() 反转列表（最新的排前面）
       - 切片 [-limit:] 取最后 N 条
     """
-    records = _TASK_STORE.list(limit=max(limit, REPORT_HISTORY_MAX_RECORDS), completed_only=True)
-    if not records:
-        records = [record for record in _load_history() if record.get("status") == "completed"]
+    # `limit` remains compatible with old callers and means first-page size.
+    size = limit or page_size
+    current_page = 1 if limit else page
+    total = _TASK_STORE.count(completed_only=True)
+    if total:
+        total_pages = max(1, (total + size - 1) // size)
+        current_page = min(current_page, total_pages)
+        offset = (current_page - 1) * size
+        records = _TASK_STORE.list(limit=size, offset=offset, completed_only=True)
+    else:
+        legacy = [record for record in reversed(_load_history()) if record.get("status") == "completed"]
+        total = len(legacy)
+        total_pages = max(1, (total + size - 1) // size)
+        current_page = min(current_page, total_pages)
+        offset = (current_page - 1) * size
+        records = legacy[offset:offset + size]
     return {
-        "items": records[:limit],  # SQLite 已按创建时间倒序
-        "total": len(records),  # 总记录数，前端分页用
+        "items": records,
+        "total": total,
+        "page": current_page,
+        "page_size": size,
+        "total_pages": total_pages,
     }
 
 
@@ -565,6 +661,28 @@ async def report_status(task_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="任务不存在")
     return record
+
+
+@router.post("/{task_id}/cancel")
+async def cancel_report(task_id: str):
+    """Cancel a report task and remove its persisted cache/files."""
+    task_id = validate_task_id(task_id)
+    task = _find_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    with _REPORT_LOCK:
+        previous_status = task.get("status")
+        _REPORT_CANCELLED.add(task_id)
+        task["status"] = "cancelled"
+        _delete_task_files(task)
+        _TASK_STORE.delete(task_id)
+        _tasks.pop(task_id, None)
+        history = [item for item in _load_history() if item.get("task_id") != task_id]
+        _save_history(history)
+        if previous_status in {"completed", "failed", "cancelled"}:
+            # A completed/failed worker will not reach its cancellation check.
+            _REPORT_CANCELLED.discard(task_id)
+    return {"task_id": task_id, "status": "cancelled"}
 
 
 @router.delete("/{task_id}")

@@ -274,7 +274,58 @@ def _generate_default_suggestions(product: str, month: str) -> list[dict]:
 
 # ===== 表7: 整改任务 =====
 
-def build_task_table(product: str, month: str, llm_tasks: str = "") -> list[list[str]]:
+def resolve_report_tasks(product: str, month: str, llm_tasks: str = "") -> list[dict]:
+    """将模型任务或规则兜底统一为报告、预览和任务草稿共用的数据。"""
+    raw_items = _parse_tasks_json(llm_tasks) if llm_tasks else []
+    if not raw_items:
+        raw_items = _generate_default_tasks(product, month)
+
+    items = []
+    for index, raw_item in enumerate(raw_items[:10], 1):
+        if not isinstance(raw_item, dict):
+            continue
+        raw_assignee = raw_item.get('assignee')
+        assignee = raw_assignee if isinstance(raw_assignee, dict) else {
+            'name': str(raw_assignee or '待定'), 'department': '', 'role': '',
+        }
+        raw_source = raw_item.get('source')
+        raw_source = raw_source if isinstance(raw_source, dict) else {}
+        finding = str(
+            raw_source.get('finding')
+            or raw_source.get('attribution_conclusion')
+            or raw_item.get('source_conclusion')
+            or '报告整改任务清单'
+        ).strip()
+        source = {
+            'analysis_type': str(raw_source.get('analysis_type') or '月度成本分析').strip(),
+            'analysis_month': str(raw_source.get('analysis_month') or month).strip(),
+            'product': str(raw_source.get('product') or product).strip(),
+            'finding': finding,
+        }
+        expected_result = str(
+            raw_item.get('expected_result') or raw_item.get('suggestion') or ''
+        ).strip()
+        items.append({
+            'task_id': str(raw_item.get('task_id') or f"TASK-{month.replace('-', '')}-{index:04d}"),
+            'task_title': str(raw_item.get('task_title') or raw_item.get('title') or f'整改任务{index}').strip(),
+            'assignee': {
+                'name': str(assignee.get('name') or '待定').strip(),
+                'department': str(assignee.get('department') or '').strip(),
+                'role': str(assignee.get('role') or '').strip(),
+            },
+            'priority': str(raw_item.get('priority') or 'medium').strip().lower(),
+            'deadline': str(raw_item.get('deadline') or '').strip(),
+            # suggestion 保留既有报告任务协议；expected_result 供任务审阅弹窗展示。
+            'suggestion': expected_result,
+            'expected_result': expected_result,
+            'source': source,
+        })
+    return items
+
+
+def build_task_table(
+    product: str, month: str, llm_tasks: str = "", task_items: list[dict] | None = None,
+) -> list[list[str]]:
     """
     整改任务表格
     列: 任务编号 | 任务标题 | 责任人 | 优先级 | 来源 | 截止时间
@@ -282,10 +333,7 @@ def build_task_table(product: str, month: str, llm_tasks: str = "") -> list[list
     参数:
         llm_tasks: LLM返回的任务JSON数组文本
     """
-    items = _parse_tasks_json(llm_tasks) if llm_tasks else []
-
-    if not items:
-        items = _generate_default_tasks(product, month)
+    items = task_items if task_items is not None else resolve_report_tasks(product, month, llm_tasks)
 
     rows = []
     for item in items:
@@ -324,29 +372,32 @@ def _generate_default_tasks(product: str, month: str) -> list[dict]:
     return [
         {
             "task_id": f"TASK-{year_month}-0001",
-            "task_title": f"{product}原材料采购成本优化专项",
+            "task_title": f"核查{product}原材料采购入库价与合同单价差异",
             "assignee": {"name": "张伟", "department": "采购部", "role": "采购经理"},
             "source": {"analysis_type": "月度成本分析", "analysis_month": month,
                         "product": product, "finding": "材料成本高于预算"},
             "priority": "high",
             "deadline": f"{month[:5]}{int(month[5:])+1:02d}-28",
+            "expected_result": "输出采购入库价与合同单价差异核查表，并提交整改措施。",
         },
         {
             "task_id": f"TASK-{year_month}-0002",
-            "task_title": f"{product}生产线效率提升计划",
+            "task_title": f"复核{product}生产工时、单耗及工艺执行记录",
             "assignee": {"name": "李强", "department": "生产部", "role": "生产主管"},
             "source": {"analysis_type": "月度成本分析", "analysis_month": month,
                         "product": product, "finding": "人工效率低于行业基准"},
             "priority": "medium",
             "deadline": f"{month[:5]}{int(month[5:])+2:02d}-30",
+            "expected_result": "输出工时、单耗及工艺执行复核记录，并提交改善方案。",
         },
         {
             "task_id": f"TASK-{year_month}-0003",
-            "task_title": "制造费用预算偏差整改",
+            "task_title": f"核查{product}设备费用、能耗及产量分摊差异",
             "assignee": {"name": "王芳", "department": "财务部", "role": "成本会计"},
             "source": {"analysis_type": "月度成本分析", "analysis_month": month,
                         "product": product, "finding": "制造费用超出预算"},
             "priority": "medium",
             "deadline": f"{month[:5]}{int(month[5:])+1:02d}-15",
+            "expected_result": "输出设备费用、能耗及产量分摊差异核查表，并提交整改措施。",
         },
     ]

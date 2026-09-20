@@ -53,8 +53,13 @@ if errorlevel 1 (
 REM --- 检查RPA mock server ---
 netstat -ano | findstr ":8090 " | findstr "LISTENING" >nul 2>&1
 if errorlevel 1 (
-    echo [警告] RPA服务(8090)未启动，整改任务派发将失败
-    echo        如需RPA功能，请另开terminal运行: start_rpa.bat
+    echo [启动] RPA Mock Server (端口 8090) ...
+    start "RPA-Server" cmd /k "cd /d ""%~dp0"" && call start_rpa.bat"
+    call :wait_for_rpa 30
+    if errorlevel 1 (
+        echo [警告] RPA服务启动超时，整改任务派发可能失败
+        echo        可查看 RPA-Server 窗口中的错误信息
+    )
     echo.
 )
 
@@ -70,3 +75,17 @@ cd app
 "%PYTHON%" -m uvicorn main:app --host 127.0.0.1 --port 8000
 
 pause
+exit /b 0
+
+:wait_for_rpa
+set /a RPA_RETRIES=%~1
+:wait_for_rpa_loop
+"%PYTHON%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()" >nul 2>&1
+if not errorlevel 1 (
+    echo [就绪] RPA Mock Server 已启动
+    exit /b 0
+)
+set /a RPA_RETRIES-=1
+if %RPA_RETRIES% LEQ 0 exit /b 1
+timeout /t 1 /nobreak >nul
+goto :wait_for_rpa_loop

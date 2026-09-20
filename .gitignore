@@ -29,7 +29,6 @@ output/
 *.sqlite3-shm
 *.sqlite3-wal
 app/settings/
-创灵境_考题模拟数据/
 tmp/
 tmp_test_*.docx
 app/rag/knowledge_manifest.json
@@ -43,3 +42,6 @@ app/rag/bm25_index_cache.json
 venv/
 .venv/
 env/
+
+*.zip
+

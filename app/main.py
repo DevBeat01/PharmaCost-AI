@@ -6,6 +6,11 @@ from pathlib import Path
 import sys
 import os
 import logging
+import asyncio
+import subprocess
+import urllib.request
+import urllib.error
+import time
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from data.cost_data import cost_service
 from routers import dashboard, report, benchmark, rpa_router, settings, auth
+from config import RPA_BASE_URL
 
 app = FastAPI(
     title="制药成本智能分析报告系统",
@@ -58,20 +64,74 @@ async def startup():
     """启动时加载数据和构建知识库"""
     cost_service.load_all()
     logger.info("数据加载完成")
+    try:
+        from analysis.dashboard import (
+            _PRIMARY_LLM_FIRST_CHUNK_TIMEOUT_SECONDS,
+            _BACKUP_LLM_FIRST_CHUNK_TIMEOUT_SECONDS,
+            _PRIMARY_LLM_TEXT_TIMEOUT_SECONDS,
+            _BACKUP_LLM_TEXT_TIMEOUT_SECONDS,
+        )
+        logger.info(
+            "归因模型超时配置: 主模型首事件%.1fs/总计%.1fs，备用模型首事件%.1fs/总计%.1fs",
+            _PRIMARY_LLM_FIRST_CHUNK_TIMEOUT_SECONDS,
+            _PRIMARY_LLM_TEXT_TIMEOUT_SECONDS,
+            _BACKUP_LLM_FIRST_CHUNK_TIMEOUT_SECONDS,
+            _BACKUP_LLM_TEXT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.exception("归因模型超时配置读取失败")
 
-    import threading
+    # 直接运行 `uvicorn app.main:app` 时不会经过 start.bat。开发/演示环境
+    # 若使用本地 Mock RPA，应用自身负责探测并拉起它，避免派发必然失败。
+    # 测试进程不启动后台服务，避免占用 8090 并污染测试环境。
+    if "pytest" not in sys.modules and not os.getenv("PHARMACOST_DISABLE_RPA_AUTOSTART"):
+        await asyncio.to_thread(_ensure_local_rpa)
 
-    def _build_kb():
-        try:
-            from rag.build_knowledge import build_knowledge_base
-            build_knowledge_base()
-            logger.info("知识库构建完成")
-        except Exception:
-            logger.warning("知识库构建警告（非致命）", exc_info=True)
-
-    # 构建在后台线程执行，避免嵌入模型初始化阻塞 API 接口启动。
-    threading.Thread(target=_build_kb, daemon=True, name="knowledge-index-builder").start()
+    # 复用设置模块的单任务调度器，启动检查与上传/删除不会并发写索引。
+    settings.request_knowledge_build("startup")
     logger.info("知识库检查已后台启动（已有索引将复用，本次启动不阻塞接口）")
+
+
+def _ensure_local_rpa() -> None:
+    """在本地默认地址不可达时启动项目自带 RPA Mock。"""
+    base_url = str(RPA_BASE_URL or "").rstrip("/")
+    if base_url not in {"http://127.0.0.1:8090", "http://localhost:8090"}:
+        return
+    health_url = f"{base_url}/health"
+    try:
+        with urllib.request.urlopen(health_url, timeout=0.6) as response:
+            if response.status < 500:
+                logger.info("RPA服务已就绪: %s", base_url)
+                return
+    except (OSError, urllib.error.URLError):
+        pass
+
+    project_root = Path(__file__).resolve().parent.parent
+    mock_script = project_root / "rpa_mock" / "mock_rpa_server.py"
+    if not mock_script.exists():
+        logger.warning("RPA服务不可达且未找到本地 Mock 服务: %s", mock_script)
+        return
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            [sys.executable, str(mock_script)],
+            cwd=str(project_root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        for _ in range(20):
+            try:
+                with urllib.request.urlopen(health_url, timeout=0.5) as response:
+                    if response.status < 500:
+                        logger.info("已自动启动本地 RPA Mock 服务: %s", base_url)
+                        return
+            except (OSError, urllib.error.URLError):
+                time.sleep(0.25)
+        logger.warning("本地 RPA Mock 服务启动超时，请检查端口 8090")
+    except OSError:
+        logger.warning("无法自动启动本地 RPA Mock 服务", exc_info=True)
 
 
 @app.get("/")

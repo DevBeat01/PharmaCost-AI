@@ -37,6 +37,48 @@ class TemplateParser:
         self.parsed = True
         return result
 
+    def placeholder_contexts(self) -> dict[str, list[dict]]:
+        """Return the nearest template heading for every placeholder.
+
+        Templates may be uploaded by users, so the report engine must derive
+        the semantic context from the active document instead of assuming the
+        bundled template layout.
+        """
+        contexts: dict[str, list[dict]] = {}
+        current_heading = ''
+        current_level = 0
+        for index, para in enumerate(self.doc.paragraphs):
+            text = para.text.strip()
+            heading = self._heading_info(text)
+            if heading:
+                current_heading, current_level = heading
+            for match in self.PLACEHOLDER_RE.finditer(text):
+                contexts.setdefault(match.group(1), []).append({
+                    'location': f'paragraph[{index}]',
+                    'heading': current_heading,
+                    'heading_level': current_level,
+                })
+        for ti, table in enumerate(self.doc.tables):
+            for ri, row in enumerate(table.rows):
+                for ci, cell in enumerate(row.cells):
+                    for match in self.PLACEHOLDER_RE.finditer(cell.text):
+                        contexts.setdefault(match.group(1), []).append({
+                            'location': f'table[{ti}][{ri},{ci}]',
+                            'heading': current_heading,
+                            'heading_level': current_level,
+                        })
+        return contexts
+
+    @staticmethod
+    def _heading_info(text: str):
+        value = str(text or '').strip()
+        if re.match(r'^[一二三四五六七八九十]+、', value):
+            return value, 1
+        matched = re.match(r'^(\d+(?:\.\d+){0,2})(?:\s+|$)', value)
+        if matched:
+            return value, matched.group(1).count('.') + 1
+        return None
+
     # ===== 段落替换 =====
 
     @staticmethod
@@ -249,6 +291,7 @@ class TemplateParser:
             return anchor
         if replace_anchor:
             self._set_paragraph_text(anchor, lines[0])
+            self._format_paragraph(anchor, self._numbered_role(lines[0]))
             current = anchor
             start = 1
         else:
@@ -256,6 +299,7 @@ class TemplateParser:
             start = 0
         for line in lines[start:]:
             current = self._insert_paragraph_after(current, line)
+            self._format_paragraph(current, self._numbered_role(line))
         return current
 
     @staticmethod
@@ -276,7 +320,8 @@ class TemplateParser:
         text = re.sub(r'^\s{0,3}#{1,6}\s*', '', text, flags=re.MULTILINE)
         text = re.sub(r'^\s*>\s?', '', text, flags=re.MULTILINE)
         text = re.sub(r'^\s*[-*+]\s+', '• ', text, flags=re.MULTILINE)
-        text = re.sub(r'^\s*\d+[.)]\s+', '• ', text, flags=re.MULTILINE)
+        # Preserve 1. / 1.1 / 1.1.1 content numbering.  These are semantic
+        # report items, not unordered bullets.
         text = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
         text = re.sub(r'\*\*(.*?)\*\*', r'\1', text, flags=re.DOTALL)
         text = re.sub(r'__(.*?)__', r'\1', text, flags=re.DOTALL)
@@ -286,6 +331,15 @@ class TemplateParser:
         text = re.sub(r'`([^`]+)`', r'\1', text)
         text = re.sub(r'^\s*[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
         return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+    @staticmethod
+    def _numbered_role(text):
+        value = str(text or '').strip()
+        if re.match(r'^\d+(?:\.\d+){1,2}\s+', value):
+            return 'numbered2'
+        if re.match(r'^\d+[.)]\s+', value):
+            return 'numbered1'
+        return None
 
     @staticmethod
     def _set_run_font(run, size=10.5, bold=None, color='000000', italic=False):
@@ -356,6 +410,16 @@ class TemplateParser:
             fmt.space_after = Pt(2)
             for run in para.runs:
                 cls._set_run_font(run, 10.5, False)
+        elif role in ('numbered1', 'numbered2'):
+            value = str(para.text or '').strip()
+            depth = 1 if role == 'numbered1' else value.split(None, 1)[0].count('.') + 1
+            fmt.left_indent = Pt(15 + (depth - 1) * 13)
+            fmt.first_line_indent = Pt(-13)
+            fmt.space_before = Pt(2)
+            fmt.space_after = Pt(4)
+            for run in para.runs:
+                # 1. / 1.1 等是填充正文的层级，不是模板章节标题。
+                cls._set_run_font(run, 10.5, False)
         elif role == 'citation':
             fmt.space_before = Pt(4)
             fmt.space_after = Pt(7)
@@ -409,7 +473,14 @@ class TemplateParser:
                 if not started and re.match(r'^(?:一、封面与基本信息|一、)', text):
                     started = True
                 if started and text:
-                    self._format_paragraph(para)
+                    # Generated numbered items already carry a hanging indent.
+                    # Preserve that role so a body item such as 2.1 is not
+                    # later mistaken for the template's 2.1 heading.
+                    numbered_role = self._numbered_role(text)
+                    if numbered_role and para.paragraph_format.left_indent is not None:
+                        self._format_paragraph(para, numbered_role)
+                    else:
+                        self._format_paragraph(para)
             elif tag == 'tbl' and started:
                 from docx.table import Table
                 self._format_table(Table(element, self.doc._body))
@@ -444,6 +515,13 @@ class TemplateParser:
             return
         # 常规段落沿用统一替换逻辑，确保同一段落中多个占位符的偏移计算正确。
         if not any('|' in str(mapping.get(match.group(1), '')) for match in matches):
+            # 文本型分析占位符需要按行写成多个 Word 段落，确保数字层级
+            # 可读，而不是挤在一个模板段落中。
+            if len(matches) == 1:
+                value = str(mapping.get(matches[0].group(1), '') or '')
+                if '\n' in value:
+                    self._insert_text_block_after(para, value, replace_anchor=True)
+                    return
             self._replace_in_paragraph(para, mapping)
             return
         # 当前模板的分析占位符通常独占一个段落。按内容顺序插入文本段落和表格，

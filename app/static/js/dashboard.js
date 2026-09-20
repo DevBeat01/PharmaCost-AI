@@ -9,6 +9,7 @@ const DashboardPage = {
     _attributionRequestId: 0,
     _attributionRenderedVersion: 0,
     _attributionController: null,
+    _attributionDebounceTimer: null,
     _attributionCache: new Map(),
     _currentAlerts: [],
     _taskGenerationContext: null,
@@ -230,6 +231,10 @@ const DashboardPage = {
     async loadAll() {
         const version = ++this._loadVersion;
         const { product, month } = Utils.currentParams();
+        if (this._attributionDebounceTimer) {
+            clearTimeout(this._attributionDebounceTimer);
+            this._attributionDebounceTimer = null;
+        }
         if (this._attributionController) this._attributionController.abort();
         this._attributionController = new AbortController();
         const attributionRequestId = ++this._attributionRequestId;
@@ -252,7 +257,13 @@ const DashboardPage = {
         // 已有当前产品/月的归因缓存时直接复用，避免页面切换或刷新再次
         // 发起 SSE/AI 请求；点击“重新分析”会主动清理缓存并 force=true。
         if (!attributionCache) {
-            void this.loadAttribution(product, month, [], version, attributionRequestId);
+            // 产品/月筛选通常会连续变化（先选产品再选月份）；等待最终
+            // 选择稳定后才调用模型，避免为中间状态消耗模型配额。
+            this._attributionDebounceTimer = setTimeout(() => {
+                this._attributionDebounceTimer = null;
+                if (!this.isAttributionCurrent(version, attributionRequestId)) return;
+                void this.loadAttribution(product, month, [], version, attributionRequestId);
+            }, 1500);
         }
         this.loadThreeDim(product, month, version);   // 三维表 + 指标卡片
         this.loadTrend(product, version);
@@ -352,6 +363,9 @@ const DashboardPage = {
                         const details = document.getElementById('attributionDetails');
                         if (full) full.innerHTML = this.markdownToHtml(accumulated);
                         if (details) { details.style.display = ''; details.open = true; }
+                    } else if (eventName === 'status') {
+                        const full = document.getElementById('attributionText');
+                        if (full && !accumulated.trim()) full.innerHTML = Utils.inlineLoading(payload.message || '模型正在生成...');
                     } else if (eventName === 'complete') {
                         finalData = payload;
                     }
@@ -417,6 +431,10 @@ const DashboardPage = {
         const { product, month } = Utils.currentParams();
         const version = this._loadVersion;
         const cacheKey = `${product}::${month}`;
+        if (this._attributionDebounceTimer) {
+            clearTimeout(this._attributionDebounceTimer);
+            this._attributionDebounceTimer = null;
+        }
         this._deleteAttributionCache(cacheKey);
         this.setTaskGenerationContext(null);
         if (this._attributionController) this._attributionController.abort();

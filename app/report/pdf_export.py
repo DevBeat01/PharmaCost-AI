@@ -6,8 +6,10 @@ from pathlib import Path
 
 try:
     import win32com.client
+    import pythoncom
 except ImportError:
     win32com = None
+    pythoncom = None
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,8 @@ def _clean_text(value):
     text = re.sub(r'^\s{0,3}#{1,6}\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*>\s?', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*[-*+]\s+', '• ', text, flags=re.MULTILINE)
-    text = re.sub(r'^\s*\d+[.)]\s+', '• ', text, flags=re.MULTILINE)
+    # Keep report body numbering (1. / 1.1 / 1.1.1) intact.  It is used by
+    # both the Word-derived and preview fallback PDF paths.
     text = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'__(.*?)__', r'\1', text, flags=re.DOTALL)
@@ -88,8 +91,14 @@ def _export_word_pdf(docx_path: str, output_path: str) -> bool:
     word = None
     document = None
     output = Path(output_path).resolve()
+    com_initialized = False
 
     try:
+        # Report generation runs in ThreadPoolExecutor workers. COM is
+        # apartment-threaded and must be initialized explicitly per worker.
+        if pythoncom is not None:
+            pythoncom.CoInitialize()
+            com_initialized = True
         word = win32com.client.DispatchEx("Word.Application")
         word.Visible = False
         document = word.Documents.Open(str(Path(docx_path).resolve()), ReadOnly=True)
@@ -123,7 +132,14 @@ def _export_word_pdf(docx_path: str, output_path: str) -> bool:
             try:
                 word.Quit()
             except Exception:
-                logger.exception("退出 Word 进程失败")
+                # Word may already have exited after ExportAsFixedFormat.
+                # Do not turn a successful PDF conversion into a scary traceback.
+                logger.warning("Word 进程已结束或无需重复退出")
+        if com_initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                logger.exception("释放 Word COM 线程失败")
 
 
 def export_pdf(report: dict, output_path: str, docx_path: str = ""):
@@ -185,11 +201,15 @@ def export_pdf(report: dict, output_path: str, docx_path: str = ""):
                     text = para.text.strip()
                     if not text:
                         continue
+                    numbered_body = bool(
+                        re.match(r'^\d+(?:\.\d+)*(?:\.\s+|\s+)', text)
+                        and para.paragraph_format.left_indent is not None
+                    )
                     if len(text) <= 42 and '成本分析' in text and text.endswith('报告'):
                         body_story.append(Paragraph(escape(_clean_text(text)), title))
                     elif re.match(r'^(?:[一二三四五六七八九十]+、|第[一二三四五六七八九十]+章)', text):
                         body_story.append(Paragraph(escape(_clean_text(text)), heading))
-                    elif re.match(r'^\d+\.\d+(?:\.\d+)?(?:\s+|$)', text):
+                    elif re.match(r'^\d+\.\d+(?:\.\d+)?(?:\s+|$)', text) and not numbered_body:
                         body_story.append(Paragraph(escape(_clean_text(text)), heading))
                     elif text.startswith('知识库参考：'):
                         body_story.append(Paragraph(escape(_clean_text(text)), meta))

@@ -113,17 +113,41 @@ def _model_bool(name: str, default: bool) -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _thinking_capability_default(provider: str, model: str) -> str:
+    """Use conservative capability hints for the bundled provider defaults."""
+    lowered = str(model or "").lower()
+    if provider == "deepseek" and (lowered.startswith("deepseek-v4") or lowered.startswith("qwen")):
+        return "configurable"
+    if provider == "mimo" and lowered.startswith("mimo-v2"):
+        return "always_on"
+    return "unknown"
+
+
+def _thinking_hint_default(capability: str) -> str:
+    return {
+        "configurable": "支持独立控制深度思考",
+        "always_on": "该模型固定启用深度思考，开关不可关闭",
+        "unsupported": "该模型不支持深度思考，开关已禁用",
+    }.get(capability, "能力尚未检测")
+
+
 DEEPSEEK_API_KEY = str(_model_value("DEEPSEEK_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")))
 DEEPSEEK_BASE_URL = str(_model_value("DEEPSEEK_BASE_URL", os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")))
 DEEPSEEK_MODEL = str(_model_value("DEEPSEEK_MODEL", os.getenv("DEEPSEEK_MODEL", "deepseek-chat")))
 DEEPSEEK_VERIFY_SSL = _model_bool("DEEPSEEK_VERIFY_SSL", os.getenv("DEEPSEEK_VERIFY_SSL", "true").strip().lower() not in {"0", "false", "no"})
 DEEPSEEK_PROVIDER_LABEL = str(_model_value("DEEPSEEK_PROVIDER_LABEL", os.getenv("DEEPSEEK_PROVIDER_LABEL", "DeepSeek")))
+DEEPSEEK_THINKING_ENABLED = _model_bool("DEEPSEEK_THINKING_ENABLED", os.getenv("DEEPSEEK_THINKING_ENABLED", "false").strip().lower() not in {"0", "false", "no"})
+DEEPSEEK_THINKING_CAPABILITY = str(_model_value("DEEPSEEK_THINKING_CAPABILITY", os.getenv("DEEPSEEK_THINKING_CAPABILITY", _thinking_capability_default("deepseek", DEEPSEEK_MODEL))))
+DEEPSEEK_THINKING_HINT = str(_model_value("DEEPSEEK_THINKING_HINT", os.getenv("DEEPSEEK_THINKING_HINT", _thinking_hint_default(DEEPSEEK_THINKING_CAPABILITY))))
 
 MIMO_API_KEY = str(_model_value("MIMO_API_KEY", os.getenv("MIMO_API_KEY", "")))
 MIMO_BASE_URL = str(_model_value("MIMO_BASE_URL", os.getenv("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")))
 MIMO_MODEL = str(_model_value("MIMO_MODEL", os.getenv("MIMO_MODEL", "mimo-v2.5")))
 MIMO_VERIFY_SSL = _model_bool("MIMO_VERIFY_SSL", os.getenv("MIMO_VERIFY_SSL", "true").strip().lower() not in {"0", "false", "no"})
 MIMO_PROVIDER_LABEL = str(_model_value("MIMO_PROVIDER_LABEL", os.getenv("MIMO_PROVIDER_LABEL", "MiMo")))
+MIMO_THINKING_ENABLED = _model_bool("MIMO_THINKING_ENABLED", os.getenv("MIMO_THINKING_ENABLED", "true").strip().lower() not in {"0", "false", "no"})
+MIMO_THINKING_CAPABILITY = str(_model_value("MIMO_THINKING_CAPABILITY", os.getenv("MIMO_THINKING_CAPABILITY", _thinking_capability_default("mimo", MIMO_MODEL))))
+MIMO_THINKING_HINT = str(_model_value("MIMO_THINKING_HINT", os.getenv("MIMO_THINKING_HINT", _thinking_hint_default(MIMO_THINKING_CAPABILITY))))
 
 # Embedding配置
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")

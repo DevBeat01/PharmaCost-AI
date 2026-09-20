@@ -1,6 +1,9 @@
 """成本看板重点分析的回归测试。"""
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "app"))
 
@@ -154,6 +157,62 @@ def test_stream_consumer_keeps_terminal_event_after_many_deltas(monkeypatch):
     )
     chunks = list(_model_stream_with_timeout("prompt", "system", timeout=2, max_tokens=10))
     assert len(chunks) == 200
+
+
+def test_stream_consumer_uses_requested_backup_provider(monkeypatch):
+    import llm.client as client_module
+    from analysis.dashboard import _model_stream_with_timeout
+
+    providers = []
+    monkeypatch.setattr(
+        client_module.llm_client,
+        "chat_stream_provider",
+        lambda provider, *args, **kwargs: (providers.append(provider) or iter(["备用模型正文"])),
+    )
+    chunks = list(
+        _model_stream_with_timeout(
+            "prompt", "system", timeout=2, max_tokens=10,
+            provider="mimo", first_chunk_timeout=1,
+        )
+    )
+    assert chunks == ["备用模型正文"]
+    assert providers == ["mimo"]
+
+
+def test_stream_consumer_enforces_first_chunk_timeout(monkeypatch):
+    import llm.client as client_module
+    from analysis.dashboard import _model_stream_with_timeout
+
+    def stalled_stream(*args, **kwargs):
+        time.sleep(0.2)
+        return iter(())
+
+    monkeypatch.setattr(client_module.llm_client, "chat_stream_provider", stalled_stream)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="首个正文分片"):
+        list(
+            _model_stream_with_timeout(
+                "prompt", "system", timeout=1, max_tokens=10,
+                provider="deepseek", first_chunk_timeout=0.03,
+            )
+        )
+    assert time.monotonic() - started < 0.15
+
+
+def test_reasoning_activity_counts_as_first_model_event(monkeypatch):
+    import llm.client as client_module
+    from analysis.dashboard import _model_stream_with_timeout
+
+    monkeypatch.setattr(
+        client_module.llm_client,
+        "chat_stream_provider",
+        lambda *args, **kwargs: iter([("activity", "隐藏推理"), ("content", "正文")]),
+    )
+    chunks = list(_model_stream_with_timeout(
+        "prompt", "system", timeout=1, max_tokens=10,
+        provider="mimo", first_chunk_timeout=0.05,
+    ))
+    assert chunks == [("activity", "隐藏推理"), ("content", "正文")]
 
 
 def test_inline_chapter_text_is_preserved():

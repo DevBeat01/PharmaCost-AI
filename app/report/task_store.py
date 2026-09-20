@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -12,12 +13,17 @@ class ReportTaskStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
+    @contextmanager
     def _connect(self):
         connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=30000")
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
 
     def _initialize(self):
         with self._lock, self._connect() as connection:
@@ -55,13 +61,20 @@ class ReportTaskStore:
             row = connection.execute("SELECT task_json FROM report_tasks WHERE task_id=?", (task_id,)).fetchone()
         return json.loads(row["task_json"]) if row else None
 
-    def list(self, limit: int = 100, completed_only: bool = False) -> list[dict]:
+    def list(self, limit: int = 100, completed_only: bool = False, offset: int = 0) -> list[dict]:
         where = " WHERE status='completed'" if completed_only else ""
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                f"SELECT task_json FROM report_tasks{where} ORDER BY created_at DESC LIMIT ?", (limit,)
+                f"SELECT task_json FROM report_tasks{where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+                (limit, max(0, offset)),
             ).fetchall()
         return [json.loads(row["task_json"]) for row in rows]
+
+    def count(self, completed_only: bool = False) -> int:
+        where = " WHERE status='completed'" if completed_only else ""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(f"SELECT COUNT(*) AS total FROM report_tasks{where}").fetchone()
+        return int(row["total"] if row else 0)
 
     def delete(self, task_id: str) -> dict | None:
         task = self.get(task_id)

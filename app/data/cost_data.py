@@ -302,28 +302,32 @@ class CostDataService:
         """获取药材市场价格行情"""
         self._check_loaded()
         result = []
+        month_num = int(str(month).split('-')[1]) if month and '-' in str(month) else None
         for _, r in self.market.iterrows():
-            month_num = int(month.split('-')[1]) if month else 1
-            price_col = f"{month_num}月价格"
             prices = {}
-            for m in range(1, 7):
+            for m in range(1, 13):
                 col = f"{m}月价格"
-                if col in r.index:
-                    prices[f"2026-{m:02d}"] = float(r[col])
+                if col in r.index and pd.notna(r[col]):
+                    try:
+                        prices[f"2026-{m:02d}"] = float(r[col])
+                    except (TypeError, ValueError):
+                        continue
+            price_col = f"{month_num}月价格" if month_num else ""
+            current_price = prices.get(f"2026-{month_num:02d}") if month_num else next(iter(prices.values()), 0)
             result.append({
-                'material_name': r['药材名称'],
-                'spec': r['规格等级'],
-                'unit': r['单位'],
-                'current_price': float(r.get(price_col, 0)),
+                'material_name': str(r.get('药材名称', '')),
+                'spec': str(r.get('规格等级', '')),
+                'unit': str(r.get('单位', '')),
+                'current_price': current_price or 0,
                 'prices': prices,
-                'source': r['价格来源'],
-                'trend': r['趋势分析'],
+                'source': str(r.get('价格来源', '')),
+                'trend': str(r.get('趋势分析', '')),
             })
         return result
 
-    def get_market_price_for_material(self, material_name: str) -> Optional[dict]:
+    def get_market_price_for_material(self, material_name: str, month: Optional[str] = None) -> Optional[dict]:
         """获取特定药材的市场行情"""
-        prices = self.get_market_prices()
+        prices = self.get_market_prices(month)
         for p in prices:
             if material_name in p['material_name'] or p['material_name'] in material_name:
                 return p

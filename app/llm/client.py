@@ -19,6 +19,8 @@ LLM API客户端（OpenAI兼容格式）
 
 import sys
 import logging
+import time
+import threading
 # sys 模块提供了对 Python 解释器的控制
 # 这里用 sys.path 修改模块搜索路径
 
@@ -99,6 +101,18 @@ class LLMClient:
         self.model = None
         self.last_provider = None
         self._providers = []
+        self.thinking_settings = {
+            "deepseek": {
+                "enabled": bool(getattr(config, "DEEPSEEK_THINKING_ENABLED", False)),
+                "capability": str(getattr(config, "DEEPSEEK_THINKING_CAPABILITY", "unknown")),
+                "hint": str(getattr(config, "DEEPSEEK_THINKING_HINT", "能力尚未检测")),
+            },
+            "mimo": {
+                "enabled": bool(getattr(config, "MIMO_THINKING_ENABLED", True)),
+                "capability": str(getattr(config, "MIMO_THINKING_CAPABILITY", "unknown")),
+                "hint": str(getattr(config, "MIMO_THINKING_HINT", "能力尚未检测")),
+            },
+        }
 
         provider_configs = {
             "deepseek": (config.DEEPSEEK_API_KEY, config.DEEPSEEK_MODEL, config.DEEPSEEK_BASE_URL, config.DEEPSEEK_VERIFY_SSL),
@@ -139,16 +153,18 @@ class LLMClient:
                 pass
         self.__init__()
 
-    @staticmethod
-    def _completion_options(model: str) -> dict:
-        """Provider-specific options that keep report generation responsive."""
-        # Qwen3 enables a lengthy reasoning pass for some compatible-endpoint
-        # deployments. Dashboard attribution needs direct report prose, not
-        # hidden chain-of-thought, otherwise the first visible token can take
-        # longer than the SSE window.
-        if str(model or "").lower().startswith("qwen3"):
-            return {"extra_body": {"enable_thinking": False}}
-        return {}
+    def _completion_options(self, model: str, provider: str | None = None, thinking_enabled: bool | None = None) -> dict:
+        """Build provider options from the independently configured thinking switch."""
+        if thinking_enabled is None and provider:
+            settings = getattr(self, "thinking_settings", {})
+            setting = settings.get(provider, {})
+            capability = str(setting.get("capability", "configurable"))
+            if capability in {"unsupported", "unknown"}:
+                return {}
+            thinking_enabled = bool(setting.get("enabled", False))
+        if thinking_enabled is None:
+            thinking_enabled = str(model or "").lower().startswith("qwen3") is False
+        return {"extra_body": {"enable_thinking": bool(thinking_enabled)}}
 
     def _chat_once(self, messages, max_tokens):
         if not self._providers:
@@ -159,7 +175,7 @@ class LLMClient:
                 response = client.chat.completions.create(
                     model=model, messages=messages,
                     max_tokens=max_tokens, temperature=0.3,
-                    **self._completion_options(model),
+                    **self._completion_options(model, provider),
                 )
                 content = response.choices[0].message.content
                 if not str(content or "").strip():
@@ -212,6 +228,90 @@ class LLMClient:
 
         return self._chat_once(messages, max_tokens)
 
+    def chat_provider(self, provider_name: str, prompt: str, system: str = "", max_tokens: int = 4000) -> str:
+        """Request one named provider without automatic failover."""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        selected = next((item for item in self._providers if item[0] == provider_name), None)
+        if selected is None:
+            raise RuntimeError(f"未配置模型提供商: {provider_name}")
+        provider, model, client = selected
+        try:
+            response = client.chat.completions.create(
+                model=model, messages=messages, max_tokens=max_tokens,
+                temperature=0.3, **self._completion_options(model, provider),
+            )
+            content = response.choices[0].message.content
+            if not str(content or "").strip():
+                raise RuntimeError("模型未返回文本")
+            self.last_provider = provider
+            return content
+        except Exception as exc:
+            raise RuntimeError(f"{provider} 文本生成失败: {exc}") from exc
+
+    def chat_stream_provider(
+        self, provider_name: str, prompt: str, system: str = "", max_tokens: int = 4000,
+        include_reasoning: bool = False, cancel_event: threading.Event | None = None,
+    ):
+        """Stream from one named provider without automatically trying another.
+
+        This is used by latency-sensitive flows that need a bounded primary
+        attempt before explicitly switching to the configured standby model.
+        """
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        selected = next((item for item in self._providers if item[0] == provider_name), None)
+        if selected is None:
+            raise RuntimeError(f"未配置模型提供商: {provider_name}")
+
+        provider, model, client = selected
+        stream = None
+        try:
+            stream = client.chat.completions.create(
+                model=model, messages=messages, max_tokens=max_tokens,
+                temperature=0.3, stream=True,
+                **self._completion_options(model, provider),
+            )
+            if cancel_event is not None:
+                def close_when_cancelled():
+                    cancel_event.wait()
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                threading.Thread(target=close_when_cancelled, daemon=True, name=f"{provider}-stream-canceller").start()
+            for chunk in stream:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                content = getattr(delta, "content", None) if delta else None
+                reasoning = getattr(delta, "reasoning_content", None) if delta else None
+                if include_reasoning and reasoning:
+                    yield ("activity", str(reasoning))
+                if content:
+                    yield ("content", str(content)) if include_reasoning else content
+            self.last_provider = provider
+        except Exception as exc:
+            raise RuntimeError(f"{provider} 流式生成失败: {exc}") from exc
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
     def chat_stream(self, prompt: str, system: str = "", max_tokens: int = 4000):
         """
         流式聊天调用——边生成边返回，实现"打字机"效果。
@@ -241,35 +341,17 @@ class LLMClient:
           - for 循环迭代流式响应
           - delta（增量）vs message（完整）
         """
-        # 构建消息列表（同 chat 方法）
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
         if not self._providers:
             raise RuntimeError("未配置 DeepSeek 或 MiMo API 密钥")
         errors = []
-        for provider, model, client in self._providers:
+        for provider, _, _ in self._providers:
             yielded = False
             try:
-                stream = client.chat.completions.create(
-                    model=model, messages=messages, max_tokens=max_tokens,
-                    temperature=0.3, stream=True,
-                    **self._completion_options(model),
-                )
-                for chunk in stream:
-                    # OpenAI-compatible providers may emit keep-alive or
-                    # usage-only chunks without choices/content.
-                    choices = getattr(chunk, "choices", None) or []
-                    if not choices:
-                        continue
-                    delta = getattr(choices[0], "delta", None)
-                    content = getattr(delta, "content", None) if delta else None
-                    if content:
-                        yielded = True
-                        yield content
-                self.last_provider = provider
+                for content in self.chat_stream_provider(provider, prompt, system, max_tokens):
+                    yielded = True
+                    yield content
+                if not yielded:
+                    raise RuntimeError("模型未返回文本")
                 return
             except Exception as exc:
                 # 已输出的流不能安全地由备用模型续写。
@@ -279,6 +361,66 @@ class LLMClient:
                     logger.warning("DeepSeek 流式生成失败，将切换 MiMo 备用模型: %s", exc)
                 errors.append(f"{provider}: {exc}")
         raise RuntimeError("; ".join(errors))
+
+    def probe_thinking_capability(self, provider_name: str, timeout: float = 12.0) -> dict:
+        """Probe whether one provider honors enable_thinking on/off."""
+        selected = next((item for item in self._providers if item[0] == provider_name), None)
+        if selected is None:
+            raise RuntimeError(f"未配置模型提供商: {provider_name}")
+        provider, model, client = selected
+        observations = {}
+        for enabled in (False, True):
+            started = time.monotonic()
+            reasoning_seen = False
+            stream = None
+            try:
+                stream = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "只回复：测试"}],
+                    max_tokens=32,
+                    temperature=0,
+                    stream=True,
+                    extra_body={"enable_thinking": enabled},
+                )
+                for chunk in stream:
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    if delta is not None and getattr(delta, "reasoning_content", None):
+                        reasoning_seen = True
+                    if time.monotonic() - started > timeout:
+                        raise TimeoutError("能力探测超时")
+                observations[enabled] = reasoning_seen
+            except Exception as exc:
+                observations[enabled] = exc
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+        off, on = observations[False], observations[True]
+        errors = [value for value in (off, on) if isinstance(value, Exception)]
+        if errors:
+            descriptions = "；".join(str(error) for error in errors)
+            lowered = descriptions.lower()
+            parameter_rejected = any(token in lowered for token in ("enable_thinking", "extra_body", "unknown parameter", "unsupported parameter", "unrecognized"))
+            if not parameter_rejected:
+                raise RuntimeError(f"深度思考能力探测失败: {descriptions}")
+            capability = "unsupported"
+            hint = "接口不接受深度思考参数，已禁用开关"
+        elif off is False and on is True:
+            capability = "configurable"
+            hint = "支持独立控制深度思考"
+        elif off is True:
+            capability = "always_on"
+            hint = "该模型固定启用深度思考，开关不可关闭"
+        else:
+            capability = "unsupported"
+            hint = "该模型未返回深度思考内容，已禁用开关"
+        return {"capability": capability, "hint": hint, "observations": {"off": bool(off) if not isinstance(off, Exception) else None, "on": bool(on) if not isinstance(on, Exception) else None}}
 
 
 # ============================================================

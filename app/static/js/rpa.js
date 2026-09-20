@@ -140,7 +140,7 @@ const RpaPage = {
             this._tablePages[tableId] = page;
             const visibleRows = rows.slice((page - 1) * pageSize, page * pageSize);
             let html = `<table class="data-table"><thead><tr>
-                <th>${selectable ? `<input type="checkbox" id="${tableId}SelectAll" aria-label="全选${selectLabel}">` : ''}</th><th>任务标题</th><th>责任人</th><th>任务来源</th><th>优先级</th><th>截止日</th><th>RPA状态</th><th>微信状态</th><th>操作</th>
+                <th>${selectable ? `<input type="checkbox" id="${tableId}SelectAll" aria-label="全选${selectLabel}">` : ''}</th><th>任务标题</th><th>责任人</th><th>任务来源</th><th>优先级</th><th>截止日</th><th>状态</th><th>详细</th><th>操作</th>
             </tr></thead><tbody>`;
             visibleRows.forEach(task => {
             const status = statusMap[task.status] || ['未知', 'info'];
@@ -154,6 +154,10 @@ const RpaPage = {
             const conclusion = String(source.attribution_conclusion || '--').replace(/\s+/g, ' ').trim();
             const sourceText = `${sourceName}：${conclusion}`;
             const sourceSummary = conclusion.length > 32 ? `${conclusion.slice(0, 32)}...` : conclusion;
+            const detailStatus = task.status === 'draft'
+                ? ['待发送至 RPA', 'info']
+                : (task.notification_status === 'sent' ? ['已发送', 'success'] : ['待发送微信', 'warning']);
+            const detailButton = `<button type="button" class="btn btn-outline btn-sm task-detail-btn" data-task-id="${Utils.escapeHtml(task.task_id)}" title="查看任务详细内容">详细</button>`;
             const actions = `<button type="button" class="btn btn-outline btn-sm task-delete-btn" data-task-id="${Utils.escapeHtml(task.task_id)}" title="删除任务记录" aria-label="删除${Utils.escapeHtml(task.task_title)}" style="color:var(--phc-state-error);border-color:var(--phc-state-error)"><i data-lucide="trash-2" style="width:15px;height:15px"></i></button>`;
             html += `<tr data-task-status="${Utils.escapeHtml(task.status)}" data-notification-status="${Utils.escapeHtml(task.notification_status || 'not_sent')}">
                 <td>${selectable ? `<input type="checkbox" class="task-selector" data-task-id="${Utils.escapeHtml(task.task_id)}" ${rowSelectable ? '' : 'disabled'} ${selected ? 'checked' : ''} aria-label="选择${Utils.escapeHtml(task.task_title)}">` : '<span aria-hidden="true">—</span>'}</td>
@@ -162,8 +166,8 @@ const RpaPage = {
                 <td title="${Utils.escapeHtml(sourceText)}" style="max-width:220px"><div style="font-weight:500">${Utils.escapeHtml(sourceName)}</div><div style="font-size:12px;color:var(--phc-ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px">${Utils.escapeHtml(sourceSummary)}</div></td>
                 <td><span class="status-pill ${priority[1]}">${priority[0]}</span></td>
                 <td>${Utils.escapeHtml(task.deadline || '--')}</td>
-                <td><span class="status-pill ${status[1]}">${status[0]}</span></td>
-                <td><span class="status-pill ${task.notification_status === 'sent' ? 'success' : (task.notification_status === 'failed' ? 'error' : 'info')}">${task.notification_status === 'sent' ? '已发送' : (task.notification_status === 'failed' ? '发送失败' : (task.status === 'draft' ? '待发送至 RPA' : '待发送'))}</span></td>
+                <td><span class="status-pill ${detailStatus[1]}">${detailStatus[0]}</span></td>
+                <td>${detailButton}</td>
                 <td>${actions}</td>
             </tr>`;
             });
@@ -204,8 +208,38 @@ const RpaPage = {
         document.querySelectorAll('.task-delete-btn').forEach(button => {
             button.addEventListener('click', () => this.deleteTask(button.dataset.taskId));
         });
+        document.querySelectorAll('.task-detail-btn').forEach(button => {
+            button.addEventListener('click', () => this.openTaskDetail(button.dataset.taskId));
+        });
         this.syncSelectAll();
         this.updateDispatchButton();
+    },
+
+    openTaskDetail(taskId) {
+        const task = this._tasksById.get(String(taskId));
+        if (!task) return;
+        document.getElementById('rpaTaskDetailDialog')?.remove();
+        const esc = value => Utils.escapeHtml(String(value ?? '--'));
+        const rpaStatus = task.status === 'draft' ? '待发送至 RPA' : (task.status === 'sent' ? '已发送至 RPA' : (task.status === 'received' ? '已送达' : (task.status === 'confirmed' ? '已确认' : (task.status === 'in_progress' ? '处理中' : (task.status === 'completed' ? '已完成' : task.status || '--')))));
+        const wechatStatus = task.notification_status === 'sent' ? '已发送' : (task.notification_status === 'failed' ? '发送失败' : (task.status === 'draft' ? '未进入微信发送阶段' : '待发送微信'));
+        const owner = `${task.assignee?.name || '--'} / ${task.assignee?.department || '--'} / ${task.assignee?.role || '--'}`;
+        const source = task.source || {};
+        const dialog = document.createElement('div');
+        dialog.id = 'rpaTaskDetailDialog';
+        dialog.className = 'rpa-detail-dialog-backdrop';
+        dialog.innerHTML = `<section class="rpa-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="rpaTaskDetailTitle">
+            <header class="rpa-detail-dialog-header"><div><h3 id="rpaTaskDetailTitle">任务详细内容</h3><p>${esc(task.task_id)}</p></div><button type="button" class="header-icon-btn" data-detail-close aria-label="关闭"><i data-lucide="x"></i></button></header>
+            <div class="rpa-detail-dialog-body">
+                <div class="rpa-detail-grid"><div><label>任务标题</label><p>${esc(task.task_title)}</p></div><div><label>责任人</label><p>${esc(owner)}</p></div><div><label>优先级</label><p>${esc({high:'高',medium:'中',low:'低'}[task.priority] || task.priority)}</p></div><div><label>截止日</label><p>${esc(task.deadline)}</p></div><div><label>RPA流程状态</label><p>${esc(rpaStatus)}</p></div><div><label>微信通知状态</label><p>${esc(wechatStatus)}</p></div></div>
+                <div class="rpa-detail-block"><label>任务来源</label><p>${esc(source.analysis_scenario || '--')}</p></div>
+                <div class="rpa-detail-block"><label>归因结论</label><p>${esc(source.attribution_conclusion || '--')}</p></div>
+                <div class="rpa-detail-block"><label>整改动作 / 交付物</label><p>${esc(task.suggestion || task.expected_result || '--')}</p></div>
+            </div><footer class="rpa-detail-dialog-footer"><button type="button" class="btn btn-primary" data-detail-close>关闭</button></footer>
+        </section>`;
+        document.body.appendChild(dialog);
+        dialog.querySelectorAll('[data-detail-close]').forEach(button => button.addEventListener('click', () => dialog.remove()));
+        dialog.addEventListener('click', event => { if (event.target === dialog) dialog.remove(); });
+        if (window.lucide) lucide.createIcons();
     },
 
     syncSelectAll() {
@@ -251,7 +285,8 @@ const RpaPage = {
         try {
             const result = await Utils.api('/api/rpa/dispatch-selected', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_ids: taskIds }), timeoutMs: 30000,
+                // 后端包含 3 次快速重试，给最慢的响应留出完整返回时间。
+                body: JSON.stringify({ task_ids: taskIds }), timeoutMs: 60000,
             });
             const firstFailure = (result.results || []).find(item => item.status !== 'sent');
             const dispatched = result.tasks_dispatched || 0;
@@ -262,7 +297,7 @@ const RpaPage = {
             if (dispatched > 0) this._selectedTaskIds.clear();
             await Promise.all([this.loadStats(), this.loadTasks()]);
         } catch (error) {
-            this.showResult(false, 'RPA派发失败，请检查服务状态');
+            this.showResult(false, error?.message || 'RPA派发失败，请检查服务状态');
         } finally {
             button.innerHTML = '<i data-lucide="send" style="width:16px;height:16px"></i> 发送至 RPA';
             this.updateDispatchButton();
@@ -271,7 +306,10 @@ const RpaPage = {
     },
 
     async deleteTask(taskId) {
-        if (!taskId || !window.confirm('删除该整改任务及其本地闭环记录？此操作不可恢复。')) return;
+        if (!taskId) return;
+        const task = this._tasksById.get(String(taskId));
+        const confirmed = await this.confirmDeleteTask(task);
+        if (!confirmed) return;
         const button = [...document.querySelectorAll('.task-delete-btn')].find(item => item.dataset.taskId === String(taskId));
         if (button) button.disabled = true;
         try {
@@ -283,6 +321,31 @@ const RpaPage = {
             this.showResult(false, '任务删除失败，请稍后重试');
             if (button) button.disabled = false;
         }
+    },
+
+    confirmDeleteTask(task) {
+        return new Promise(resolve => {
+            document.getElementById('rpaDeleteConfirmDialog')?.remove();
+            const esc = value => Utils.escapeHtml(String(value ?? '--'));
+            const dialog = document.createElement('div');
+            dialog.id = 'rpaDeleteConfirmDialog';
+            dialog.className = 'rpa-confirm-dialog-backdrop';
+            dialog.innerHTML = `<section class="rpa-confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="rpaDeleteConfirmTitle">
+                <div class="rpa-confirm-dialog-icon"><i data-lucide="trash-2"></i></div>
+                <div class="rpa-confirm-dialog-content"><h3 id="rpaDeleteConfirmTitle">删除整改任务</h3><p>确定删除这条整改任务及其本地闭环记录吗？</p><div class="rpa-confirm-dialog-task">${esc(task?.task_title || '未命名任务')}</div><small>删除后不可恢复，已发送到 RPA 的远端记录不会被删除。</small></div>
+                <div class="rpa-confirm-dialog-actions"><button type="button" class="btn btn-outline" data-confirm-cancel>取消</button><button type="button" class="btn btn-danger" data-confirm-ok><i data-lucide="trash-2"></i>确认删除</button></div>
+            </section>`;
+            document.body.appendChild(dialog);
+            let onKey;
+            const finish = value => { document.removeEventListener('keydown', onKey); dialog.remove(); resolve(value); };
+            dialog.querySelector('[data-confirm-cancel]').addEventListener('click', () => finish(false));
+            dialog.querySelector('[data-confirm-ok]').addEventListener('click', () => finish(true));
+            dialog.addEventListener('click', event => { if (event.target === dialog) finish(false); });
+            onKey = event => { if (event.key === 'Escape') finish(false); };
+            document.addEventListener('keydown', onKey);
+            if (window.lucide) lucide.createIcons();
+            dialog.querySelector('[data-confirm-cancel]').focus();
+        });
     },
 
     async notifySelectedTasks() {

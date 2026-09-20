@@ -94,10 +94,27 @@ def _read_index_meta() -> dict:
 
 
 def _write_index_meta(fingerprint: str, chunk_count: int):
-    _INDEX_META_PATH.write_text(
+    temp = _INDEX_META_PATH.with_suffix(".tmp")
+    temp.write_text(
         json.dumps({"fingerprint": fingerprint, "chunk_count": chunk_count}, ensure_ascii=False),
         encoding="utf-8",
     )
+    temp.replace(_INDEX_META_PATH)
+
+
+def _write_manifest(manifest: dict) -> None:
+    temp = _MANIFEST_PATH.with_suffix(".tmp")
+    temp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    temp.replace(_MANIFEST_PATH)
+
+
+def _restore_file(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        path.unlink(missing_ok=True)
+    else:
+        temp = path.with_suffix(path.suffix + ".restore")
+        temp.write_bytes(previous)
+        temp.replace(path)
 
 
 def _fingerprint(doc: dict) -> str:
@@ -172,8 +189,6 @@ def _build_knowledge_base_locked():
     for entry in manifest.values():
         all_chunks.extend(entry.get('chunks', []))
 
-    build_bm25_index(all_chunks)
-    _MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     index_fingerprint = _manifest_fingerprint(manifest)
     index_meta = _read_index_meta()
     index_reusable = (
@@ -183,19 +198,30 @@ def _build_knowledge_base_locked():
         and VectorStore.is_index_ready(index_fingerprint, len(all_chunks))
     )
     if index_reusable:
+        build_bm25_index(all_chunks)
         print(f"复用本地 Chroma 向量索引: {len(all_chunks)} 个片段")
-    elif VectorStore.ensure_embedding_model_ready():
-        try:
-            vs = get_vector_store()
-            vs.clear()
-            vs.add_documents(all_chunks)
-            _write_index_meta(index_fingerprint, len(all_chunks))
-            print(f"Chroma 向量索引构建完成: {vs.count()} 个片段")
-        except Exception:
-            # BM25 has already been built above, so vector-index failures remain non-fatal.
-            print("Chroma 向量索引构建失败，已回退至 BM25 检索")
     else:
-        print("本地嵌入模型下载或初始化失败，已回退至 BM25 检索")
+        if not VectorStore.ensure_embedding_model_ready():
+            raise RuntimeError("嵌入模型下载或初始化失败，已保留上一版知识库")
+        old_manifest = _MANIFEST_PATH.read_bytes() if _MANIFEST_PATH.is_file() else None
+        old_meta = _INDEX_META_PATH.read_bytes() if _INDEX_META_PATH.is_file() else None
+
+        def commit_metadata():
+            try:
+                build_bm25_index(all_chunks)
+                _write_manifest(manifest)
+                _write_index_meta(index_fingerprint, len(all_chunks))
+            except Exception:
+                _restore_file(_MANIFEST_PATH, old_manifest)
+                _restore_file(_INDEX_META_PATH, old_meta)
+                raise
+
+        VectorStore.replace_documents_atomically(all_chunks, on_promoted=commit_metadata)
+        print(f"Chroma 向量索引构建完成: {len(all_chunks)} 个片段")
+    if index_reusable:
+        # Keep metadata durable even when the existing vector collection is reused.
+        _write_manifest(manifest)
+        _write_index_meta(index_fingerprint, len(all_chunks))
     print(f"知识库构建完成: {len(documents)} 个文档, {len(all_chunks)} 个片段")
     return len(all_chunks)
 
