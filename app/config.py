@@ -149,8 +149,20 @@ MIMO_THINKING_ENABLED = _model_bool("MIMO_THINKING_ENABLED", os.getenv("MIMO_THI
 MIMO_THINKING_CAPABILITY = str(_model_value("MIMO_THINKING_CAPABILITY", os.getenv("MIMO_THINKING_CAPABILITY", _thinking_capability_default("mimo", MIMO_MODEL))))
 MIMO_THINKING_HINT = str(_model_value("MIMO_THINKING_HINT", os.getenv("MIMO_THINKING_HINT", _thinking_hint_default(MIMO_THINKING_CAPABILITY))))
 
-# Embedding配置
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
+# Embedding 配置。嵌入模型使用独立的百炼凭据，绝不复用文本模型密钥。
+DASHSCOPE_API_KEY = str(os.getenv("DASHSCOPE_API_KEY", "")).strip()
+DASHSCOPE_BASE_URL = str(
+    os.getenv(
+        "DASHSCOPE_BASE_URL",
+        "https://ws-lkhiqcv5vwspvls3.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    )
+).strip().rstrip("/")
+DASHSCOPE_EMBEDDING_MODEL = str(
+    os.getenv("DASHSCOPE_EMBEDDING_MODEL", "qwen3.7-text-embedding")
+).strip()
+EMBEDDING_DIMENSION = 1024
+# Retain the name for older diagnostics/config consumers; local mode is gone.
+EMBEDDING_PROVIDER = "dashscope"
 
 # 向量数据库
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", str(APP_DIR / "chroma_db"))

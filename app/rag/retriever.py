@@ -117,7 +117,7 @@ def bm25_search(query: str, top_k: int = 5) -> list[dict]:
 def vector_search(query: str, top_k: int = 5) -> list[dict]:
     """向量语义检索（知识库未就绪时返回空,由混合检索回退到BM25）"""
     if not VectorStore.is_embedding_model_ready():
-        logger.info("向量检索跳过（本地嵌入模型未就绪）")
+        logger.info("向量检索跳过（未配置 DASHSCOPE_API_KEY，仅使用 BM25 降级）")
         return []
     try:
         vs = get_vector_store()
@@ -125,8 +125,8 @@ def vector_search(query: str, top_k: int = 5) -> list[dict]:
         for r in results:
             r['method'] = 'vector'
         return results
-    except Exception:
-        logger.warning("向量检索跳过（知识库未就绪）")
+    except Exception as exc:
+        logger.warning("向量检索跳过（百炼嵌入索引未就绪）: %s", exc)
         return []
 
 

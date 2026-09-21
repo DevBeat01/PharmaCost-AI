@@ -29,7 +29,7 @@ echo [环境] Python: %PYTHON%
 
 REM --- 自动安装依赖：评委首次双击时无需再输入 pip 命令 ---
 echo [检查] Python 依赖...
-"%PYTHON%" -c "import fastapi, uvicorn, pandas, docx, reportlab, chromadb, sentence_transformers, rank_bm25, jieba, httpx, dotenv" >nul 2>&1
+"%PYTHON%" -c "import fastapi, uvicorn, pandas, docx, reportlab, chromadb, rank_bm25, jieba, httpx, dotenv, openai" >nul 2>&1
 if errorlevel 1 (
     echo [安装] 首次运行，正在安装依赖；该步骤需要网络，可能需要数分钟...
     "%PYTHON%" -m pip install --disable-pip-version-check -r app\requirements.txt

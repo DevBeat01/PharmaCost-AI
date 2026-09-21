@@ -12,7 +12,7 @@
 
 ## 技术栈
 
-FastAPI、Pandas、Chroma、Sentence-Transformers、BM25、DeepSeek（主）/MiMo（备用）、SQLite、ECharts、原生 HTML/CSS/JavaScript、Docker Compose。
+FastAPI、Pandas、Chroma、百炼 Embedding API、BM25、DeepSeek（主）/MiMo（备用）、SQLite、ECharts、原生 HTML/CSS/JavaScript、Docker Compose。
 
 ## 目录
 
@@ -47,7 +47,7 @@ E:\Anacounda\python.exe -m pip install -r app/requirements.txt
 评委只需准备比赛数据包并双击项目根目录的 `start_all.bat`。脚本会自动检查 Python、首次安装依赖、启动主应用和模拟 RPA 服务，等待健康检查通过后自动打开浏览器。
 
 - 默认使用 `E:\Anacounda\python.exe`；其他环境可将 `PHARMACOST_PYTHON` 设置为 Python 完整路径后再双击。
-- 首次安装依赖和首次下载本地嵌入模型需要网络；后续启动复用已安装依赖和本地索引。
+- 首次构建知识库会调用百炼 Embedding API；后续启动复用已生成的本地索引。
 - 不配置模型 API Key 时，基础数据看板和对标数据仍可使用；AI 归因、任务生成和智能报告需在 `app/.env` 配置可用密钥。
 - 服务启动后访问 <http://127.0.0.1:8000>；关闭两个标题为 `PharmaCost-Web` 与 `RPA-Server` 的命令窗口即可停止服务。
 
@@ -59,7 +59,7 @@ E:\Anacounda\python.exe -m pip install -r app/requirements.txt
 - API 文档：<http://127.0.0.1:8000/docs>
 - RPA Mock：<http://127.0.0.1:8090/docs>
 
-也可分别运行 `start.bat` 与 `start_rpa.bat`。首次启动会在后台构建本地 RAG 索引；已下载的嵌入模型、Chroma 索引、SQLite 任务库和报告输出都仅保留在本地，不会提交到 Git。
+也可分别运行 `start.bat` 与 `start_rpa.bat`。首次启动会在后台构建 RAG 索引；Chroma 索引、SQLite 任务库和报告输出都仅保留在本地，不会提交到 Git。
 
 ## Docker Compose
 

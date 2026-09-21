@@ -50,6 +50,13 @@ if errorlevel 1 (
     echo.
 )
 
+findstr /r "DASHSCOPE_API_KEY=.\+" "app\.env" >nul 2>&1
+if errorlevel 1 (
+    echo [提示] 尚未配置百炼 Embedding API Key，知识库将无法构建向量索引
+    echo        请编辑 app\.env 填入 DASHSCOPE_API_KEY
+    echo.
+)
+
 REM --- 检查RPA mock server ---
 netstat -ano | findstr ":8090 " | findstr "LISTENING" >nul 2>&1
 if errorlevel 1 (
@@ -67,7 +74,7 @@ if not defined RPA_BASE_URL set "RPA_BASE_URL=http://127.0.0.1:8090"
 
 REM --- 启动主应用 ---
 echo [启动] 主应用 uvicorn on http://127.0.0.1:8000
-echo [启动] 知识库构建在后台异步运行（首次启动需下载模型约80MB）
+echo [启动] 知识库构建在后台异步运行（使用百炼 Embedding API）
 echo [停止] 按 Ctrl+C
 echo.
 
