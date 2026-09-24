@@ -44,7 +44,7 @@ E:\Anacounda\python.exe -m pip install -r app/requirements.txt
 
 ## 评审一键启动（Windows）
 
-评委只需准备比赛数据包并双击项目根目录的 `start_all.bat`。脚本会自动检查 Python、首次安装依赖、启动主应用和模拟 RPA 服务，等待健康检查通过后自动打开浏览器。
+只需准备比赛数据包并双击项目根目录的 `start_all.bat`。脚本会自动检查 Python、首次安装依赖、启动主应用和模拟 RPA 服务，等待健康检查通过后自动打开浏览器。
 
 - 默认使用 `E:\Anacounda\python.exe`；其他环境可将 `PHARMACOST_PYTHON` 设置为 Python 完整路径后再双击。
 - 首次构建知识库会调用百炼 Embedding API；后续启动复用已生成的本地索引。

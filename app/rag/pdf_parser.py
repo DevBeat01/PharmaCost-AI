@@ -1,7 +1,11 @@
 """知识文档解析模块"""
 from pathlib import Path
 
-import pymupdf as fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    # PyMuPDF 1.24.0 及更早版本仅提供 `fitz` 顶层模块，`pymupdf` 别名自 1.24.3 引入。
+    import fitz as fitz
 from docx import Document
 
 
